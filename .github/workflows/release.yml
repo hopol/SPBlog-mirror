@@ -35,6 +35,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "name=$(jq -r '.name // .tag_name' <<<"$json")" >> "$GITHUB_OUTPUT"
           echo "prerelease=$(jq -r '.prerelease' <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "asset_count=$(jq -r '.assets | length' <<<"$json")" >> "$GITHUB_OUTPUT"
       - name: 检查是否已经镜像
         id: exists
         shell: bash
@@ -42,12 +43,16 @@ jobs:
           tag="mirror-release-${{ steps.upstream.outputs.tag }}"
           git rev-parse -q --verify "refs/tags/$tag" >/dev/null && echo "exists=true" >> "$GITHUB_OUTPUT" || echo "exists=false" >> "$GITHUB_OUTPUT"
       - name: 下载上游附件
-        if: steps.exists.outputs.exists != 'true'
+        if: steps.exists.outputs.exists != 'true' && steps.upstream.outputs.asset_count != '0'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           mkdir -p release-assets
           gh release download "${{ steps.upstream.outputs.tag }}" --repo "$UPSTREAM_REPO" --dir release-assets
+      - name: 说明上游没有发布附件
+        if: steps.exists.outputs.exists != 'true' && steps.upstream.outputs.asset_count == '0'
+        run: echo "上游 Release 不包含附件；将创建仅含发布说明的镜像 Release。"
       - name: 创建镜像 Release
         if: steps.exists.outputs.exists != 'true'
         shell: bash
