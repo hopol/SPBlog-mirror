@@ -24,7 +24,7 @@ session_set_cookie_params([
 ]);
 session_start();
 
-const APP_VERSION = 'v1.9.4';
+const APP_VERSION = 'v1.12.0';
 const DATA_DIR = __DIR__ . '/data';
 const CACHE_DIR = __DIR__ . '/cache';
 const ADMIN_PRESENCE_FILE = CACHE_DIR . '/admin-presence.json';
@@ -39,6 +39,7 @@ const UPDATE_CACHE_FILE = CACHE_DIR . '/github-update.json';
 const BUNDLED_RELEASE_FILES = [
     'themes/adams/theme.json',
     'themes/clarity/theme.json',
+    'themes/clay/theme.json',
     'themes/farallon/theme.json',
     'themes/hammeros/theme.json',
     'themes/jaguar/theme.json',
@@ -48,6 +49,7 @@ const BUNDLED_RELEASE_FILES = [
     'themes/nojs/theme.json',
     'themes/once/theme.json',
     'themes/paper/theme.json',
+    'themes/photograph/theme.json',
     'themes/starter/theme.json',
     'themes/timellow/theme.json',
     'themes/ying/theme.json',
@@ -55,14 +57,23 @@ const BUNDLED_RELEASE_FILES = [
     'plugins/ai-assistant/plugin.php',
     'plugins/akismet/plugin.json',
     'plugins/akismet/plugin.php',
+    'plugins/avatar-source/plugin.json',
+    'plugins/avatar-source/plugin.php',
     'plugins/email-notifications/plugin.json',
     'plugins/email-notifications/plugin.php',
     'plugins/english-language/plugin.json',
     'plugins/english-language/plugin.php',
     'plugins/russian-language/plugin.json',
     'plugins/russian-language/plugin.php',
+    'plugins/rest-api/plugin.json',
+    'plugins/rest-api/plugin.php',
+    'plugins/rest-api/includes/admin.php',
+    'plugins/rest-api/includes/http.php',
+    'plugins/rest-api/includes/resources.php',
     'plugins/s3-storage/plugin.json',
     'plugins/s3-storage/plugin.php',
+    'plugins/typecho-importer/plugin.json',
+    'plugins/typecho-importer/plugin.php',
 ];
 
 function db_file_path(): string
@@ -163,6 +174,12 @@ function table_columns(PDO $pdo, string $table): array
     }
 
     return $columns;
+}
+
+function content_contains_image(string $content): bool
+{
+    return preg_match('/!\[[^\]]*\]\((?:<)?[^\s)>]+(?:>)?(?:\s+["\'][^"\']*["\'])?\)|<img\b[^>]*\bsrc=["\'][^"\']+["\'][^>]*>/i', $content) === 1
+        || preg_match('#https?://[^\s<>"\']+?\.(?:jpe?g|png|gif|webp|avif)(?:\?[^\s<>"\']*)?#i', $content) === 1;
 }
 
 function import_legacy_local_media(PDO $pdo): void
@@ -322,6 +339,7 @@ function ensure_schema(PDO $pdo): void
             excerpt TEXT NOT NULL DEFAULT '',
             content TEXT NOT NULL,
             kind TEXT NOT NULL DEFAULT 'post',
+            post_format TEXT NOT NULL DEFAULT 'text',
             tags TEXT NOT NULL DEFAULT '[]',
             views INTEGER NOT NULL DEFAULT 0,
             is_pinned INTEGER NOT NULL DEFAULT 0,
@@ -450,6 +468,17 @@ function ensure_schema(PDO $pdo): void
         $pdo->exec("ALTER TABLE posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'post'");
     }
 
+    if (!isset($columns['post_format'])) {
+        $pdo->exec("ALTER TABLE posts ADD COLUMN post_format TEXT NOT NULL DEFAULT 'text'");
+        $selectPosts = $pdo->query("SELECT id, content FROM posts WHERE kind = 'post'");
+        $markImagePost = $pdo->prepare("UPDATE posts SET post_format = 'image' WHERE id = ?");
+        foreach ($selectPosts->fetchAll() as $post) {
+            if (content_contains_image((string)$post['content'])) {
+                $markImagePost->execute([(int)$post['id']]);
+            }
+        }
+    }
+
     if (!isset($columns['tags'])) {
         $pdo->exec("ALTER TABLE posts ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
     }
@@ -466,6 +495,7 @@ function ensure_schema(PDO $pdo): void
     }
 
     $pdo->exec("UPDATE posts SET kind = 'post' WHERE kind IS NULL OR trim(kind) = ''");
+    $pdo->exec("UPDATE posts SET post_format = 'text' WHERE kind = 'page' OR post_format NOT IN ('text', 'image')");
     $pdo->exec("UPDATE posts SET tags = '[]' WHERE tags IS NULL OR trim(tags) = ''");
     $pdo->exec("UPDATE posts SET views = 0 WHERE views IS NULL");
     $pdo->exec("UPDATE posts SET is_pinned = 0 WHERE is_pinned IS NULL");
@@ -769,14 +799,20 @@ function sblog_default_translations(): array
         'plugin.ai-assistant.description' => '为文章提供 Slug 生成、摘要生成和正文润色功能。',
         'plugin.akismet.name' => 'Akismet 垃圾评论拦截',
         'plugin.akismet.description' => '提交评论前通过 Akismet 检测垃圾内容，并提供连接状态与拦截统计。',
+        'plugin.avatar-source.name' => '自定义头像源',
+        'plugin.avatar-source.description' => '全主题统一自定义评论头像服务，支持 Gravatar、Cravatar、Libravatar 和 URL 模板。',
         'plugin.email-notifications.name' => '邮件通知',
         'plugin.email-notifications.description' => '通过 SMTP 或 PHP mail 发送密码重置和评论通知邮件。',
         'plugin.english-language.name' => '英文语言包',
         'plugin.english-language.description' => '将博客前台、登录页面和后台管理界面翻译为英文。',
         'plugin.russian-language.name' => '俄语语言包',
         'plugin.russian-language.description' => '将博客前台、登录页面和后台管理界面翻译为俄语。',
+        'plugin.rest-api.name' => 'WordPress REST API',
+        'plugin.rest-api.description' => '为 SBlog 提供兼容 WordPress /wp-json/wp/v2 格式的 REST API 与 Application Password 鉴权。',
         'plugin.s3-storage.name' => 'S3 存储',
         'plugin.s3-storage.description' => '将编辑器新上传的附件保存到 Amazon S3 或兼容的对象存储。',
+        'plugin.typecho-importer.name' => 'Typecho 数据导入',
+        'plugin.typecho-importer.description' => '预检并选择性导入 Typecho 官方 .dat 备份中的文章、页面、用户、分类、标签、评论和附件元数据。',
         'theme.default.name' => '内置终端主题',
         'theme.default.description' => '程序自带的终端风格前台主题。',
         'theme.hammeros.name' => 'HammerOS 锤伴',
@@ -922,6 +958,10 @@ function plugin_display_metadata(string $slug, array $manifest): array
             'name' => sblog_t('plugin.akismet.name'),
             'description' => sblog_t('plugin.akismet.description'),
         ],
+        'avatar-source' => [
+            'name' => sblog_t('plugin.avatar-source.name'),
+            'description' => sblog_t('plugin.avatar-source.description'),
+        ],
         'email-notifications' => [
             'name' => sblog_t('plugin.email-notifications.name'),
             'description' => sblog_t('plugin.email-notifications.description'),
@@ -934,9 +974,17 @@ function plugin_display_metadata(string $slug, array $manifest): array
             'name' => sblog_t('plugin.russian-language.name'),
             'description' => sblog_t('plugin.russian-language.description'),
         ],
+        'rest-api' => [
+            'name' => sblog_t('plugin.rest-api.name'),
+            'description' => sblog_t('plugin.rest-api.description'),
+        ],
         's3-storage' => [
             'name' => sblog_t('plugin.s3-storage.name'),
             'description' => sblog_t('plugin.s3-storage.description'),
+        ],
+        'typecho-importer' => [
+            'name' => sblog_t('plugin.typecho-importer.name'),
+            'description' => sblog_t('plugin.typecho-importer.description'),
         ],
         default => null,
     };
@@ -2563,7 +2611,18 @@ function gravatar_url(string $email, int $size = 72): string
 {
     $hash = md5(strtolower(trim($email)));
     $size = max(16, min(512, $size));
-    return 'https://www.gravatar.com/avatar/' . $hash . '?s=' . $size . '&d=identicon&r=g';
+    $defaultUrl = 'https://www.gravatar.com/avatar/' . $hash . '?s=' . $size . '&d=identicon&r=g';
+    $filteredUrl = plugin_filter('avatar_url', $defaultUrl, [
+        'email' => $email,
+        'hash' => $hash,
+        'size' => $size,
+        'default_image' => 'identicon',
+        'rating' => 'g',
+    ]);
+    $safeUrl = is_string($filteredUrl) || is_numeric($filteredUrl)
+        ? safe_link_url(trim((string)$filteredUrl))
+        : '#';
+    return $safeUrl !== '#' ? $safeUrl : $defaultUrl;
 }
 
 function social_profile_definitions(): array
@@ -4271,6 +4330,7 @@ function validate_post_input(array $input, ?array $existing = null): array
     $content = trim((string)($input['content'] ?? ''));
     $excerpt = trim((string)($input['excerpt'] ?? ''));
     $kind = (string)($input['kind'] ?? 'post');
+    $postFormat = (string)($input['post_format'] ?? 'text');
     $categoryId = (int)($input['category_id'] ?? 0);
     $tagsInput = trim((string)($input['tags_input'] ?? ''));
     $status = (string)($input['status'] ?? 'draft');
@@ -4288,6 +4348,7 @@ function validate_post_input(array $input, ?array $existing = null): array
     }
 
     $kind = $kind === 'page' ? 'page' : 'post';
+    $postFormat = $kind === 'post' && $postFormat === 'image' ? 'image' : 'text';
     $categoryId = $kind === 'post' && $categoryId > 0 && one('SELECT id FROM categories WHERE id = ?', [$categoryId]) ? $categoryId : null;
     if ($kind === 'post' && $categoryId === null) {
         $errors[] = '文章必须选择一个分类。';
@@ -4338,6 +4399,7 @@ function validate_post_input(array $input, ?array $existing = null): array
         'excerpt' => $excerpt,
         'content' => $content,
         'kind' => $kind,
+        'post_format' => $postFormat,
         'category_id' => $categoryId,
         'tags' => $tags,
         'status' => $status,
@@ -4355,6 +4417,7 @@ function save_post(array $data, ?int $id = null): int
     }
     $values = [
         $data['kind'],
+        (string)($data['post_format'] ?? 'text'),
         $data['category_id'],
         $data['slug'],
         $data['title'],
@@ -4370,7 +4433,7 @@ function save_post(array $data, ?int $id = null): int
 
     if ($id !== null) {
         q(
-            'UPDATE posts SET kind = ?, category_id = ?, slug = ?, title = ?, tags = ?, excerpt = ?, content = ?, status = ?, published_at = ?, is_pinned = ?, allow_comments = ?, updated_at = ? WHERE id = ?',
+            'UPDATE posts SET kind = ?, post_format = ?, category_id = ?, slug = ?, title = ?, tags = ?, excerpt = ?, content = ?, status = ?, published_at = ?, is_pinned = ?, allow_comments = ?, updated_at = ? WHERE id = ?',
             array_merge($values, [$now, $id])
         );
         plugin_action('post_saved', ['post_id' => $id, 'created' => false, 'data' => $data]);
@@ -4378,7 +4441,7 @@ function save_post(array $data, ?int $id = null): int
     }
 
     q(
-        'INSERT INTO posts(author_id, kind, category_id, slug, title, tags, excerpt, content, status, published_at, is_pinned, allow_comments, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO posts(author_id, kind, post_format, category_id, slug, title, tags, excerpt, content, status, published_at, is_pinned, allow_comments, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         array_merge([(int)(current_admin()['id'] ?? 0)], $values, [$now, $now])
     );
     $postId = (int)db()->lastInsertId();
@@ -4390,6 +4453,7 @@ function post_form_from_request(array $input): array
 {
     return [
         'kind' => (string)($input['kind'] ?? 'post'),
+        'post_format' => (string)($input['post_format'] ?? 'text'),
         'category_id' => (string)($input['category_id'] ?? ''),
         'title' => (string)($input['title'] ?? ''),
         'slug' => (string)($input['slug'] ?? ''),
@@ -6442,15 +6506,81 @@ function render_admin_tags_page(array $form = [], array $errors = []): void
     require_admin();
     $tags = tag_index_data(false);
     $old = trim((string)($_GET['tag'] ?? $form['old_tag'] ?? ''));
-    $currentSlug = $old !== '' ? tag_slug_for_label($old) : '';
+    $selectedTag = null;
+    foreach ($tags as $tag) {
+        if ((string)$tag['label'] === $old) {
+            $selectedTag = $tag;
+            break;
+        }
+    }
+    if ($selectedTag === null && !$errors) {
+        $old = '';
+    }
+    $currentSlug = (string)($form['tag_slug'] ?? $selectedTag['slug'] ?? '');
+    $maxTagCount = max(1, ...array_map(static fn(array $tag): int => (int)$tag['count'], $tags));
     $sidebar = render_admin_sidebar('tags');
     ob_start(); ?>
-    <div class="admin-shell"><?= $sidebar ?><div class="admin-main"><?= render_admin_topbar(sblog_t('标签管理')) ?><div class="admin-grid admin-grid--split">
-      <section class="panel admin-list-panel"><div class="panel__header"><h2><?= h(sblog_t('标签列表')) ?></h2><p class="panel__meta"><?= h(sblog_tn('标签来自文章内容，共 {count} 个标签。', count($tags))) ?></p></div><div class="panel__body panel__body--flush">
-      <?php if ($tags): ?><form method="post" action="<?= h(url_for('delete_tag')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定删除选中的标签吗？文章本身不会被删除。'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);"><?= csrf_field() ?><div class="table-wrap"><table class="admin-table"><thead><tr><th><input type="checkbox" aria-label="<?= h(sblog_t('全选')) ?>" data-check-all="tag_ids[]"></th><th><?= h(sblog_t('标签')) ?></th><th><?= h(sblog_t('Slug')) ?></th><th><?= h(sblog_t('文章数')) ?></th><th><?= h(sblog_t('操作')) ?></th></tr></thead><tbody><?php foreach ($tags as $tag): ?><tr><td><input type="checkbox" name="tag_ids[]" value="<?= h((string)$tag['label']) ?>" aria-label="<?= h(sblog_t('选择标签 {tag}', ['tag' => (string)$tag['label']])) ?>"></td><td><strong>#<?= h((string)$tag['label']) ?></strong></td><td><?= h((string)$tag['slug']) ?></td><td><?= h((string)$tag['count']) ?></td><td><a class="button button--ghost" href="<?= h(url_with_query(url_for('admin_tags'), ['tag' => (string)$tag['label']])) ?>"><?= h(sblog_t('修改')) ?></a></td></tr><?php endforeach; ?></tbody></table></div><div class="panel__body"><button class="button button--danger" type="submit"><?= h(sblog_t('批量删除')) ?></button></div></form><?php else: ?><div class="empty-state empty-state--inside"><p><?= h(sblog_t('还没有标签。')) ?></p></div><?php endif; ?>
-      </div></section>
-      <section class="panel admin-list-panel"><div class="panel__header"><h2><?= h(sblog_t('修改标签')) ?></h2></div><div class="panel__body"><?php if ($errors): ?><div class="flash flash--error"><?= h(implode(' ', translated_admin_form_errors($errors))) ?></div><?php endif; ?><form class="form-stack" method="post" action="<?= h(url_for('save_tag')) ?>"><?= csrf_field() ?><div class="field"><label><?= h(sblog_t('原标签')) ?></label><input name="old_tag" value="<?= h($old) ?>" readonly required></div><div class="field"><label><?= h(sblog_t('标签名称')) ?></label><input name="new_tag" value="<?= h((string)($form['new_tag'] ?? $old)) ?>" required></div><div class="field"><label><?= h(sblog_t('Slug')) ?></label><input name="tag_slug" value="<?= h((string)($form['tag_slug'] ?? $currentSlug)) ?>" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" required><p class="field-hint"><?= h(sblog_t('仅使用小写字母、数字和连字符。')) ?></p></div><div class="action-row"><button class="button"><?= h(sblog_t('保存修改')) ?></button></div></form></div></section>
-    </div></div></div><?php
+    <div class="admin-shell">
+      <?= $sidebar ?>
+      <div class="admin-main">
+        <?= render_admin_topbar(sblog_t('标签管理')) ?>
+        <div class="admin-grid admin-grid--split tag-manager" data-tag-manager data-base-url="<?= h(url_for('admin_tags')) ?>">
+          <section class="panel admin-list-panel tag-cloud-panel">
+            <div class="panel__header">
+              <h2><?= h(sblog_t('标签列表')) ?></h2>
+              <p class="panel__meta"><?= h(sblog_tn('标签来自文章内容，共 {count} 个标签。', count($tags))) ?></p>
+            </div>
+            <div class="panel__body">
+              <?php if ($tags): ?>
+                <form class="tag-cloud-form" method="post" action="<?= h(url_for('delete_tag')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定删除选中的标签吗？文章本身不会被删除。'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                  <?= csrf_field() ?>
+                  <div class="tag-cloud__toolbar">
+                    <button class="button button--secondary tag-cloud__select-all" type="button" data-tag-check-all aria-pressed="false"><?= h(sblog_t('全选')) ?></button>
+                    <span class="tag-cloud__selection" data-tag-selection-count aria-live="polite"></span>
+                    <button class="button button--danger" type="submit" data-tag-delete><?= h(sblog_t('批量删除')) ?></button>
+                  </div>
+                  <div class="tag-cloud" role="list">
+                    <?php foreach ($tags as $tag): ?>
+                      <?php
+                      $label = (string)$tag['label'];
+                      $isSelected = $old !== '' && $label === $old;
+                      $weight = $maxTagCount > 1 ? (int)round((((int)$tag['count'] - 1) / ($maxTagCount - 1)) * 3) : 0;
+                      ?>
+                      <div class="tag-cloud__item tag-cloud__item--weight-<?= $weight ?><?= $isSelected ? ' is-active is-marked' : '' ?>" role="listitem" data-tag-item data-tag-label="<?= h($label) ?>" data-tag-slug="<?= h((string)$tag['slug']) ?>">
+                        <input type="hidden" name="tag_ids[]" value="<?= h($label) ?>" data-tag-input<?= $isSelected ? '' : ' disabled' ?>>
+                        <button class="tag-cloud__button" type="button" data-tag-select data-tag-url="<?= h(url_with_query(url_for('admin_tags'), ['tag' => $label])) ?>" aria-pressed="<?= $isSelected ? 'true' : 'false' ?>">
+                          <span class="tag-cloud__name">#<?= h($label) ?></span>
+                          <span class="tag-cloud__count"><?= h(sblog_tn('{count} 篇', (int)$tag['count'])) ?></span>
+                        </button>
+                      </div>
+                    <?php endforeach; ?>
+                  </div>
+                </form>
+              <?php else: ?>
+                <div class="empty-state empty-state--inside"><p><?= h(sblog_t('还没有标签。')) ?></p></div>
+              <?php endif; ?>
+            </div>
+          </section>
+
+          <section class="panel admin-list-panel tag-editor" data-tag-editor>
+            <div class="panel__header">
+              <h2><?= h(sblog_t('修改标签')) ?></h2>
+              <p class="panel__meta" data-tag-editor-status><?= h($old !== '' ? '#' . $old : sblog_t('未选择标签')) ?></p>
+            </div>
+            <div class="panel__body">
+              <?php if ($errors): ?><div class="flash flash--error"><?= h(implode(' ', translated_admin_form_errors($errors))) ?></div><?php endif; ?>
+              <form class="form-stack" method="post" action="<?= h(url_for('save_tag')) ?>" data-tag-edit-form>
+                <?= csrf_field() ?>
+                <div class="field"><label><?= h(sblog_t('原标签')) ?></label><input name="old_tag" value="<?= h($old) ?>" readonly required data-tag-old<?= $old === '' ? ' disabled' : '' ?>></div>
+                <div class="field"><label><?= h(sblog_t('标签名称')) ?></label><input name="new_tag" value="<?= h((string)($form['new_tag'] ?? $old)) ?>" required data-tag-name<?= $old === '' ? ' disabled' : '' ?>></div>
+                <div class="field"><label><?= h(sblog_t('Slug')) ?></label><input name="tag_slug" value="<?= h($currentSlug) ?>" pattern="[a-z0-9]+(?:-[a-z0-9]+)*" required data-tag-slug<?= $old === '' ? ' disabled' : '' ?>><p class="field-hint"><?= h(sblog_t('仅使用小写字母、数字和连字符。')) ?></p></div>
+                <div class="action-row"><button class="button" data-tag-save<?= $old === '' ? ' disabled' : '' ?>><?= h(sblog_t('保存修改')) ?></button></div>
+              </form>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div><?php
     render_layout(sblog_t('标签管理'), (string)ob_get_clean(), ['active' => 'tags', 'wide' => true, 'description' => sblog_t('标签管理')]);
 }
 
@@ -6901,6 +7031,7 @@ function render_editor_page(?array $existing = null, array $form = [], array $er
     $defaultCategoryId = $categories ? (string)$categories[0]['id'] : '';
     $defaults = [
         'kind' => (string)($existing['kind'] ?? 'post'),
+        'post_format' => (string)($existing['post_format'] ?? 'text'),
         'category_id' => (string)($existing['category_id'] ?? $defaultCategoryId),
         'title' => (string)($existing['title'] ?? ''),
         'slug' => (string)($existing['slug'] ?? ''),
@@ -6915,6 +7046,7 @@ function render_editor_page(?array $existing = null, array $form = [], array $er
 
     $values = array_merge($defaults, $form);
     $isEdit = $existing !== null;
+    $showPostFormat = active_theme_slug() === 'photograph';
     $siteName = setting('site_name', default_settings()['site_name']);
     $editorContext = ['is_edit' => $isEdit, 'post_id' => (int)($existing['id'] ?? 0)];
     $editorActions = [];
@@ -6991,6 +7123,24 @@ function render_editor_page(?array $existing = null, array $form = [], array $er
                   <input id="published_at" name="published_at" type="datetime-local" value="<?= h((string)$values['published_at']) ?>">
                 </div>
               </div>
+
+              <?php if ($showPostFormat): ?>
+                <fieldset class="field post-format-field" data-post-format-field>
+                  <legend><?= h(sblog_t('博客形式')) ?></legend>
+                  <div class="post-format-control">
+                    <label>
+                      <input name="post_format" type="radio" value="text"<?= (string)$values['post_format'] !== 'image' ? ' checked' : '' ?>>
+                      <span><strong><?= h(sblog_t('文字博客')) ?></strong><small><?= h(sblog_t('标准文章布局')) ?></small></span>
+                    </label>
+                    <label>
+                      <input name="post_format" type="radio" value="image"<?= (string)$values['post_format'] === 'image' ? ' checked' : '' ?>>
+                      <span><strong><?= h(sblog_t('图片博客')) ?></strong><small><?= h(sblog_t('相册网格布局')) ?></small></span>
+                    </label>
+                  </div>
+                </fieldset>
+              <?php else: ?>
+                <input name="post_format" type="hidden" value="<?= (string)$values['post_format'] === 'image' ? 'image' : 'text' ?>">
+              <?php endif; ?>
 
               <div class="field">
                 <label for="tags_input"><?= h(sblog_t('标签')) ?></label>
