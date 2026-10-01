@@ -3,3 +3,8 @@ data
 .DS_Store
 /uploads
 /.claude
+/themes/*/
+/plugins/*/
+!/plugins/english-language/
+!/plugins/russian-language/
+/store/catalog.json

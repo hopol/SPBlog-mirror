@@ -45,9 +45,7 @@ function initComments() {
             block: "start",
           });
           requestAnimationFrame(() => {
-            if (parentInput.value === commentId) {
-              content.focus({ preventScroll: true });
-            }
+            if (parentInput.value === commentId) content.focus({ preventScroll: true });
           });
         });
       } else {
@@ -70,13 +68,11 @@ function initComments() {
     root.addEventListener("click", (event) => {
       event.stopPropagation();
       if (!(event.target instanceof Element)) return;
-
       const replyButton = event.target.closest("[data-comment-reply]");
       if (replyButton && root.contains(replyButton)) {
         setReply(replyButton);
         return;
       }
-
       if (event.target.closest("[data-comment-reply-cancel]")) clearReply();
     });
 
@@ -85,177 +81,67 @@ function initComments() {
   });
 }
 
-function initTerminal() {
-  const term = document.querySelector(".terminal");
-  const output = document.querySelector("#output");
-  const input = document.querySelector("#input");
-  const shown = document.querySelector("#input-text");
-  const ghost = document.querySelector("#ghost-text");
-  const scan = document.querySelector("#scanlines");
-  if (!term || !output || !input || !shown || !ghost || !scan) return;
+function initSiteTools() {
+  const tools = document.querySelector("[data-site-tools]");
+  if (!tools) return;
 
-  const history = [];
-  let historyIndex = 0;
-  const routes = {
-    home: term.dataset.home,
-    tags: term.dataset.tags,
-    links: term.dataset.links,
-    archives: term.dataset.archives,
+  const progress = tools.querySelector("[data-scroll-progress]");
+  const backToTop = tools.querySelector("[data-back-to-top]");
+  const percent = tools.querySelector("[data-scroll-percent]");
+  const themeToggle = tools.querySelector("[data-public-theme-toggle]");
+  const root = document.documentElement;
+  const systemDark = window.matchMedia("(prefers-color-scheme: dark)");
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let progressFrame = 0;
+
+  const updateProgress = () => {
+    progressFrame = 0;
+    const scrollable = Math.max(0, root.scrollHeight - root.clientHeight);
+    const value = scrollable > 0 ? Math.round(Math.min(1, Math.max(0, window.scrollY / scrollable)) * 100) : 0;
+    progress.style.setProperty("--scroll-progress", `${value}%`);
+    percent.textContent = `${value}%`;
   };
-  const commands = [
-    "help",
-    "ls",
-    "cat",
-    "cd",
-    "pwd",
-    "clear",
-    "history",
-    "theme",
-    "crt",
-    "date",
-    "home",
-    "tags",
-    "links",
-    "archives",
-  ];
-
-  const print = (text, className = "") => {
-    const line = document.createElement("div");
-    line.className = `line ${className}`;
-    line.textContent = text;
-    output.append(line);
-    output.scrollTop = output.scrollHeight;
+  const scheduleProgress = () => {
+    if (!progressFrame) progressFrame = window.requestAnimationFrame(updateProgress);
   };
 
-  const syncInput = () => {
-    shown.textContent = input.value;
-    const hit = commands.find((command) => command.startsWith(input.value) && command !== input.value);
-    ghost.textContent = input.value && hit ? hit.slice(input.value.length) : "";
-  };
-
-  const switchTheme = (name) => {
-    const themes = {
-      phosphor: ["#7ec699", "#a8e8a8"],
-      amber: ["#e8a87c", "#ffb86c"],
-      cyan: ["#7aa6da", "#a8d0f0"],
-    };
-    const theme = themes[name];
-    if (!theme) {
-      print(sblogText("terminal_themes_available", "themes: phosphor, amber, cyan"), "dim");
-      return;
-    }
-
-    document.documentElement.style.setProperty("--green", theme[0]);
-    document.documentElement.style.setProperty("--bright", theme[1]);
-    print(sblogText("terminal_theme_switched", "theme: switched to {name}", { name }), "green");
-  };
-
-  const runCommand = (raw) => {
-    const value = raw.trim();
-    const [command, argument] = value.split(/\s+/, 2);
-    print(`visitor@devlog:~$ ${value}`, "cmd-echo");
-
-    if (!value) return;
-    if (routes[command]) {
-      location.href = routes[command];
-      return;
-    }
-    if (command === "clear") {
-      output.innerHTML = "";
-      return;
-    }
-    if (command === "pwd") {
-      print("~", "green");
-      return;
-    }
-    if (command === "date") {
-      print(new Date().toLocaleString(document.documentElement.lang || undefined), "green");
-      return;
-    }
-    if (command === "crt") {
-      scan.classList.toggle("disabled");
-      print(scan.classList.contains("disabled")
-        ? sblogText("terminal_crt_scanlines_disabled", "CRT scanlines: disabled")
-        : sblogText("terminal_crt_scanlines_enabled", "CRT scanlines: enabled"), "dim");
-      return;
-    }
-    if (command === "history") {
-      history.forEach((item, index) => print(`${String(index + 1).padStart(4)}  ${item}`, "dim"));
-      return;
-    }
-    if (command === "theme") {
-      switchTheme(argument);
-      return;
-    }
-    if (command === "ls") {
-      print("home/  tags/  links/  archives/  rss.xml", "green");
-      document.querySelectorAll(".posts .post a").forEach((link) => print(`${link.textContent}.md`, "blue"));
-      return;
-    }
-    if (command === "cd" || command === "cat") {
-      print(command === "cd"
-        ? sblogText("terminal_use_cd", "Use: cd tags")
-        : sblogText("terminal_use_cat", "Use: open an article link from ls"), "dim");
-      return;
-    }
-    if (command === "help") {
-      print(sblogText("terminal_commands_heading", "COMMANDS"), "amber");
-      print(sblogText("terminal_help_ls", "  ls                         list posts and sections"));
-      print(sblogText("terminal_help_navigation", "  home|tags|links|archives   navigate site"));
-      print(sblogText("terminal_help_utilities", "  clear|history|pwd          shell utilities"));
-      print(sblogText("terminal_help_theme", "  theme <name>               phosphor, amber, cyan"));
-      print(sblogText("terminal_help_display", "  crt|date                    display controls"));
-      return;
-    }
-
-    print(sblogText("terminal_command_not_found", '{command}: command not found. Type "help".', { command }), "red");
-  };
-
-  input.addEventListener("input", syncInput);
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      if (input.value.trim()) {
-        history.push(input.value.trim());
-        historyIndex = history.length;
-      }
-      runCommand(input.value);
-      input.value = "";
-      syncInput();
-    } else if (event.key === "Tab" && ghost.textContent) {
-      event.preventDefault();
-      input.value += ghost.textContent;
-      syncInput();
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      if (historyIndex > 0) input.value = history[--historyIndex] || "";
-      syncInput();
-    } else if (event.key === "ArrowDown") {
-      event.preventDefault();
-      input.value =
-        historyIndex < history.length - 1 ? history[++historyIndex] : ((historyIndex = history.length), "");
-      syncInput();
-    } else if (event.ctrlKey && event.key.toLowerCase() === "l") {
-      event.preventDefault();
-      output.innerHTML = "";
-    }
+  backToTop.addEventListener("click", () => {
+    window.scrollTo({ top: 0, behavior: reducedMotion.matches ? "auto" : "smooth" });
   });
+  window.addEventListener("scroll", scheduleProgress, { passive: true });
+  window.addEventListener("resize", scheduleProgress);
+  window.addEventListener("pageshow", scheduleProgress);
+  updateProgress();
 
-  document.addEventListener("click", () => input.focus());
-
-  const updateSize = () => {
-    const info = document.querySelector("#term-info");
-    if (info) {
-      info.textContent = `${Math.floor(output.clientWidth / 8)}×${Math.floor(output.clientHeight / 16)}`;
-    }
+  const isDark = () => root.dataset.publicTheme === "dark"
+    || (!root.dataset.publicTheme && systemDark.matches);
+  const updateThemeToggle = () => {
+    const dark = isDark();
+    const label = dark
+      ? sblogText("switch_to_light", "切换到浅色模式")
+      : sblogText("switch_to_dark", "切换到深色模式");
+    themeToggle.setAttribute("aria-label", label);
+    themeToggle.setAttribute("aria-pressed", dark ? "true" : "false");
+    themeToggle.setAttribute("title", label);
   };
 
-  addEventListener("resize", updateSize);
-  updateSize();
-  setTimeout(() => document.querySelector("#turn-on")?.remove(), 800);
-  input.focus();
+  themeToggle.addEventListener("click", () => {
+    const next = isDark() ? "light" : "dark";
+    root.dataset.publicTheme = next;
+    try {
+      localStorage.setItem("sblog-public-theme", next);
+    } catch (error) {
+      // Keep the selected mode for this page even if storage is unavailable.
+    }
+    updateThemeToggle();
+  });
+  if (typeof systemDark.addEventListener === "function") {
+    systemDark.addEventListener("change", updateThemeToggle);
+  } else {
+    systemDark.addListener(updateThemeToggle);
+  }
+  updateThemeToggle();
 }
-document.addEventListener("DOMContentLoaded", () => {
-  initComments();
-  initTerminal();
-});
+
+document.addEventListener("DOMContentLoaded", initComments);
+document.addEventListener("DOMContentLoaded", initSiteTools);

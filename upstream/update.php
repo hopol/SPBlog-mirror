@@ -18,6 +18,7 @@ const UPDATE_CACHE_DIR = __DIR__ . '/cache';
 const UPDATE_CONFIG_FILE = UPDATE_DATA_DIR . '/config.php';
 const UPDATE_LOCK_FILE = UPDATE_DATA_DIR . '/install.lock';
 const UPDATE_SETTINGS_CACHE_FILE = UPDATE_CACHE_DIR . '/settings.php';
+const UPDATE_DATABASE_SCHEMA_VERSION = 1;
 
 function update_h(string|int $value): string
 {
@@ -74,7 +75,7 @@ function update_default_settings(): array
         'site_keywords' => '',
         'site_footer' => '',
         'custom_head_code' => '',
-        'active_theme' => 'nebula',
+        'active_theme' => 'default',
         'active_plugins' => '[]',
         'favicon_url' => 'favicon.png',
         'footer_beian' => '',
@@ -116,9 +117,11 @@ if (!$admin) {
     exit;
 }
 
+$installedSchemaVersion = (int)($db->query("SELECT value FROM settings WHERE name = 'database_schema_version'")->fetchColumn() ?: 0);
+$databaseIsNewer = $installedSchemaVersion > UPDATE_DATABASE_SCHEMA_VERSION;
 $message = '';
-$error = '';
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+$error = $databaseIsNewer ? '数据库版本高于当前程序版本，请先更新程序，不能使用旧版升级脚本。' : '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !$databaseIsNewer) {
     $token = (string)($_POST['csrf_token'] ?? '');
     $sessionToken = (string)($_SESSION['csrf_token'] ?? '');
     if ($sessionToken === '' || !hash_equals($sessionToken, $token)) {
@@ -135,8 +138,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $db->exec('ALTER TABLE posts ADD COLUMN allow_comments INTEGER NOT NULL DEFAULT 0');
                 $changes[] = '新增独立页评论开关';
             }
+            if (!update_has_column($db, 'posts', 'content_password_hash')) {
+                $db->exec("ALTER TABLE posts ADD COLUMN content_password_hash TEXT NOT NULL DEFAULT ''");
+                $changes[] = '新增文章密码保护字段';
+            }
             $db->exec('UPDATE posts SET is_pinned = 0 WHERE is_pinned IS NULL');
             $db->exec('UPDATE posts SET allow_comments = 0 WHERE allow_comments IS NULL');
+            $db->exec("UPDATE posts SET content_password_hash = '' WHERE content_password_hash IS NULL");
             $db->exec('CREATE INDEX IF NOT EXISTS idx_posts_public_pinned ON posts(kind, status, is_pinned DESC, published_at DESC, id DESC)');
             $commentsExist = (bool)$db->query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'comments' LIMIT 1")->fetchColumn();
             $db->exec(
@@ -310,6 +318,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $changes[] = '更新用户社交平台字段';
             }
 
+            if ($installedSchemaVersion < UPDATE_DATABASE_SCHEMA_VERSION) {
+                $db->prepare('INSERT OR REPLACE INTO settings(name, value) VALUES(?, ?)')
+                    ->execute(['database_schema_version', (string)UPDATE_DATABASE_SCHEMA_VERSION]);
+                $changes[] = '更新数据库版本记录';
+            }
+
             $db->commit();
             update_write_settings_cache($db);
             $message = $changes ? '数据库升级完成：' . implode('、', $changes) . '。' : '数据库已经是最新版本，无需变更。';
@@ -332,7 +346,7 @@ if (!isset($_SESSION['csrf_token']) || !is_string($_SESSION['csrf_token']) || $_
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>数据库升级</title>
-  <link rel="stylesheet" href="<?= update_h(is_file(__DIR__ . '/assets/admin.css') ? 'assets/admin.css' : 'themes/starter/assets/admin.css') ?>">
+  <link rel="stylesheet" href="<?= update_h('assets/admin.css') ?>">
 </head>
 <body class="theme-admin theme-admin--guest">
   <main class="main-wrap">
@@ -345,7 +359,7 @@ if (!isset($_SESSION['csrf_token']) || !is_string($_SESSION['csrf_token']) || $_
         <form method="post">
           <input type="hidden" name="csrf_token" value="<?= update_h((string)$_SESSION['csrf_token']) ?>">
           <div class="form-actions">
-            <button class="button button--primary" type="submit">开始升级</button>
+            <button class="button button--primary" type="submit"<?= $databaseIsNewer ? ' disabled' : '' ?>>开始升级</button>
             <a class="button button--secondary" href="index.php?a=admin">返回后台</a>
           </div>
         </form>

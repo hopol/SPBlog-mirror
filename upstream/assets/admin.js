@@ -70,8 +70,10 @@ function initThemeManager() {
       const isActive = card.dataset.themeSlug === slug;
       card.classList.toggle("is-active", isActive);
       card.querySelector("[data-theme-current]")?.toggleAttribute("hidden", !isActive);
+      card.querySelector("[data-theme-inactive]")?.toggleAttribute("hidden", isActive);
       card.querySelector("[data-theme-activate]")?.toggleAttribute("hidden", isActive);
-      card.querySelector("[data-theme-active]")?.toggleAttribute("hidden", !isActive);
+      card.querySelector("[data-theme-deactivate]")?.toggleAttribute("hidden", !isActive);
+      card.querySelector("[data-theme-uninstall]")?.toggleAttribute("hidden", isActive);
     });
   };
 
@@ -117,6 +119,24 @@ function initThemeManager() {
           const button = item.querySelector('button[type="submit"]');
           if (button instanceof HTMLButtonElement) button.disabled = false;
         });
+      }
+    });
+  });
+}
+
+function initExtensionInstalls() {
+  document.querySelectorAll("[data-extension-install]").forEach((form) => {
+    if (!(form instanceof HTMLFormElement)) return;
+    form.addEventListener("submit", (event) => {
+      if (form.getAttribute("aria-busy") === "true") {
+        event.preventDefault();
+        return;
+      }
+      const button = form.querySelector('button[type="submit"]');
+      form.setAttribute("aria-busy", "true");
+      if (button instanceof HTMLButtonElement) {
+        button.disabled = true;
+        button.textContent = button.dataset.installLabel || "Installing...";
       }
     });
   });
@@ -187,7 +207,26 @@ function initAdminNavigation() {
   const toggle = document.querySelector("[data-admin-nav-toggle]");
   const closeControls = document.querySelectorAll("[data-admin-nav-close]");
   const mobile = window.matchMedia("(max-width: 760px)");
+  const compact = window.matchMedia("(min-width: 761px) and (max-width: 1280px)");
+  const expand = sidebar?.querySelector("[data-admin-side-expand]");
   if (!(sidebar instanceof HTMLElement) || !(toggle instanceof HTMLButtonElement)) return;
+
+  let sidebarExpanded = false;
+  try {
+    sidebarExpanded = localStorage.getItem("sblog-admin-sidebar-expanded") === "1";
+  } catch (error) {
+    // The control remains usable when storage is unavailable.
+  }
+  const syncSidebar = () => {
+    const expanded = compact.matches && sidebarExpanded;
+    body.classList.toggle("admin-side-expanded", expanded);
+    if (expand instanceof HTMLButtonElement) {
+      const label = expanded ? expand.dataset.collapseLabel : expand.dataset.expandLabel;
+      expand.setAttribute("aria-expanded", expanded ? "true" : "false");
+      expand.setAttribute("aria-label", label);
+      expand.setAttribute("title", label);
+    }
+  };
 
   const setOpen = (open, restoreFocus = false) => {
     const mobileOpen = mobile.matches && open;
@@ -218,6 +257,17 @@ function initAdminNavigation() {
   };
 
   toggle.addEventListener("click", () => setOpen(!body.classList.contains("admin-nav-open"), true));
+  if (expand instanceof HTMLButtonElement) {
+    expand.addEventListener("click", () => {
+      sidebarExpanded = !sidebarExpanded;
+      try {
+        localStorage.setItem("sblog-admin-sidebar-expanded", sidebarExpanded ? "1" : "0");
+      } catch (error) {
+        // Keep the current page state even when storage is unavailable.
+      }
+      syncSidebar();
+    });
+  }
   closeControls.forEach((control) => control.addEventListener("click", () => setOpen(false, true)));
   sidebar.querySelectorAll("a").forEach((link) => link.addEventListener("click", () => setOpen(false)));
   document.addEventListener("keydown", (event) => {
@@ -229,6 +279,12 @@ function initAdminNavigation() {
   } else {
     mobile.addListener(handleViewportChange);
   }
+  if (typeof compact.addEventListener === "function") {
+    compact.addEventListener("change", syncSidebar);
+  } else {
+    compact.addListener(syncSidebar);
+  }
+  syncSidebar();
   setOpen(false);
 }
 
@@ -256,13 +312,91 @@ function initSettingsControls() {
 function initPostFormatControl() {
   const kind = document.getElementById("kind");
   const field = document.querySelector("[data-post-format-field]");
-  if (!(kind instanceof HTMLSelectElement) || !(field instanceof HTMLElement)) return;
+  const postOnlyFields = document.querySelectorAll("[data-post-only-field]");
+  if (!(kind instanceof HTMLSelectElement)) return;
 
   const syncVisibility = () => {
-    field.hidden = kind.value === "page";
+    const isPage = kind.value === "page";
+    if (field instanceof HTMLElement) field.hidden = isPage;
+    postOnlyFields.forEach((postOnlyField) => {
+      postOnlyField.hidden = isPage;
+      postOnlyField.querySelectorAll("input, select, textarea, button").forEach((control) => {
+        control.disabled = isPage;
+      });
+    });
   };
   kind.addEventListener("change", syncVisibility);
   syncVisibility();
+}
+
+function initEditorLeaveWarning() {
+  const form = document.querySelector("[data-editor-form]");
+  if (!(form instanceof HTMLFormElement)) return;
+
+  const serialize = () => {
+    const entries = [];
+    new FormData(form).forEach((value, name) => {
+      if (name === "csrf_token" || value instanceof File) return;
+      entries.push([name, String(value)]);
+    });
+    return JSON.stringify(entries);
+  };
+  const initialState = serialize();
+  const initiallyUnsaved = form.dataset.unsavedInitial === "1";
+  const hasUnsavedChanges = () => initiallyUnsaved || serialize() !== initialState;
+  const message = sblogText(
+    "unsaved_changes_confirm",
+    "当前编辑内容尚未保存。确定离开编辑页面吗？",
+  );
+  let allowUnload = false;
+
+  const allowNavigation = (event) => {
+    allowUnload = true;
+    window.setTimeout(() => {
+      if (event.defaultPrevented) allowUnload = false;
+    }, 0);
+  };
+  const confirmLeave = () => {
+    if (!hasUnsavedChanges()) return true;
+    return window.confirm(message);
+  };
+
+  form.addEventListener("submit", allowNavigation);
+  document.addEventListener("submit", (event) => {
+    const submittedForm = event.target;
+    if (!(submittedForm instanceof HTMLFormElement) || submittedForm === form) return;
+    if (submittedForm.target && submittedForm.target.toLowerCase() !== "_self") return;
+    if (!confirmLeave()) {
+      event.preventDefault();
+      return;
+    }
+    allowNavigation(event);
+  }, true);
+  document.addEventListener("click", (event) => {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const target = event.target;
+    const link = target instanceof Element ? target.closest("a[href]") : null;
+    if (!(link instanceof HTMLAnchorElement) || link.hasAttribute("download")) return;
+    if (link.target && link.target.toLowerCase() !== "_self") return;
+
+    const destination = new URL(link.href, window.location.href);
+    const sameDocumentAnchor = destination.origin === window.location.origin
+      && destination.pathname === window.location.pathname
+      && destination.search === window.location.search
+      && (destination.hash !== "" || link.getAttribute("href") === "#");
+    if (sameDocumentAnchor) return;
+    if (!confirmLeave()) {
+      event.preventDefault();
+      return;
+    }
+    allowNavigation(event);
+  });
+  window.addEventListener("beforeunload", (event) => {
+    if (allowUnload || !hasUnsavedChanges()) return;
+    event.preventDefault();
+    event.returnValue = "";
+  });
+  window.addEventListener("pageshow", () => { allowUnload = false; });
 }
 
 function initTagManager() {
@@ -680,6 +814,11 @@ function initMarkdownEditor() {
       insertBlock(block, 4);
     }
     if (action === "horizontal-rule") insertBlock("---");
+    if (action === "reply-hidden") {
+      const selected = editor.value.slice(editor.selectionStart, editor.selectionEnd)
+        || sblogText("reply_hidden_content", "回复后可见的内容");
+      insertBlock(`[reply]\n${selected}\n[/reply]`, "[reply]\n".length, selected.length);
+    }
   };
 
   root.querySelectorAll("[data-markdown-action]").forEach((button) => {
@@ -771,11 +910,13 @@ function initAiEditor() {
 document.addEventListener("DOMContentLoaded", () => {
   initAdminTheme();
   initThemeManager();
+  initExtensionInstalls();
   initPasswordToggles();
   initAdminNavigation();
   initAccountMenus();
   initSettingsControls();
   initPostFormatControl();
+  initEditorLeaveWarning();
   initTagManager();
   initMarkdownEditor();
   initAttachmentUploader();

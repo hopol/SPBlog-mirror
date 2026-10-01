@@ -5,7 +5,7 @@
 - 主程序集中在 `index.php`
 - 安装流程集中在 `install.php`
 - SQLite 存储
-- 内置多套可切换的响应式前台主题
+- 内置轻量默认主题和英俄语言插件，其他主题与功能插件独立发布
 
 ## 功能
 
@@ -25,10 +25,8 @@
 - 站点基础设置
 - 可扩展前台主题、主题资源与 action/filter 钩子
 - 可启停插件、插件 action/filter 钩子与后台插件管理
-- 内置可选的英文界面语言插件
-- 内置可启停的 AI 辅助、邮件通知与 S3 附件上传插件，配置分别独立保存
 - 独立主题管理，可预览并切换前台主题
-- 内置 Mango 与 NoJS 等多套前台主题
+- 后台扩展商店，可远程获取、校验、安装和更新主题与插件
 - 后台自动检查 GitHub Release 并一键更新程序
 - 可选伪静态 URL
 - 基础 Markdown 渲染
@@ -49,7 +47,7 @@
 - PHP 8.0+
 - `pdo_sqlite` 扩展
 - `fileinfo` 扩展
-- 使用 S3 上传时需要 `curl` 扩展
+- `curl` 与 `zip` 扩展（扩展商店远程安装）
 - Apache / Nginx / Caddy / PHP 内置服务器
 
 ## 安装
@@ -85,8 +83,9 @@ assets/admin.js 后台管理交互
 data/          SQLite、安装锁、配置
 cache/         设置缓存
 uploads/       本地上传文件及可选的 S3 备份
-themes/        自定义前台主题
-plugins/       功能插件与语言插件
+themes/        自定义主题开发说明（默认主题内置于核心）
+plugins/       英俄语言插件与插件开发说明
+store/         扩展商店索引协议说明（不部署到站点）
 ```
 
 ## 配置与缓存
@@ -101,26 +100,39 @@ plugins/       功能插件与语言插件
 
 ## 自定义主题
 
+- 核心源码只包含内置默认主题，不附带自定义主题；官方自定义主题统一维护在独立扩展仓库中。
 - 每个主题放在 `themes/<主题目录>/`，并提供 `theme.json`。
 - 可通过 `style.css` 覆盖前台样式，通过 `functions.php` 注册 action/filter 钩子，也可用 `layout.php` 接管完整前台布局。
-- 后台“主题管理”可预览并启用主题；无效或被删除的主题会回退到内置主题。
+- 可从后台“扩展商店”远程安装主题，再到“主题管理”预览和启用；无效或被删除的主题会回退到默认主题。
+- “主题管理”会对比商店版本，发现新版本时可直接在主题卡片中升级。
+- 自定义主题可先停用（切回内置默认主题）再卸载；卸载会删除服务器上的主题目录。内置默认主题不可卸载。
 - 主题开发接口与完整钩子列表见 `themes/README.md`。
-- Butterfly 移植主题及默认选项见 `themes/butterfly/README.md`，可在后台主题管理中预览和启用。
-- 一键更新只覆盖程序发布文件，不会清空额外的自定义主题目录。
+- 主题独立于核心发布；一键更新只覆盖核心程序文件，不会覆盖或删除已安装主题。
 
 ## 插件
 
+- 核心源码只保留 English 与 Russian 语言插件；其他官方功能插件统一维护在独立扩展仓库中。
 - 每个插件放在 `plugins/<插件目录>/`，并提供 `plugin.json` 和 `plugin.php`。
-- 后台“插件管理”可以启用、停用和设置插件；内置功能插件不再占用独立侧边栏入口。
+- 可从后台“扩展商店”远程安装插件，再到“插件管理”启用、停用和设置。
+- “插件管理”会显示商店中的新版本，并可在插件列表中直接升级。
+- 插件可先停用再卸载；卸载会删除服务器上的插件目录，不会删除插件写入的数据库数据。
 - 插件可使用带优先级的 action/filter 扩展请求、文章保存、评论创建、后台菜单和最终 HTML 输出。
-- 所有内置插件在新安装时默认停用，可按需在后台“插件管理”中启用。
-- 项目内置 `english-language` 与 `russian-language` 插件，启用后会将前台、登录页和后台系统界面翻译为对应语言，不修改数据库中的文章内容；语言插件之间互斥。
 - 插件开发接口与完整钩子列表见 `plugins/README.md`。
 - 插件 PHP 是服务器端可信代码，只安装来源可信的插件。
 
+## 扩展商店
+
+- 默认索引来自独立仓库 [`jkjoy/SBlog-Extensions`](https://github.com/jkjoy/SBlog-Extensions) 的 `catalog` 分支，GitHub Raw 不可用时自动回退到 jsDelivr，列表缓存 6 小时。
+- 可通过服务器环境变量 `SBLOG_EXTENSION_STORE_URL` 切换到自建仓库或 CDN 索引；缓存与索引 URL 绑定，切换源后不会复用旧源数据。
+- 官方仓库的 GitHub Actions 会校验扩展清单和版本，为每个主题、插件生成独立 ZIP 与 Release，并在资产校验通过后发布 `catalog.json`。
+- 安装器限制下载大小、文件数量与解压体积，拒绝绝对路径、目录穿越和符号链接，并强制校验 ZIP 的 SHA-256。
+- 更新已安装扩展前会将旧目录移动到 `cache/extension-backup-*`，安装失败时自动回滚。
+- “站点设置”可分别清理核心/扩展更新备份和可重建缓存；站点设置、限流记录、重置令牌及其他未知文件不会被清理。
+- 索引协议与独立部署方法见 `store/README.md`。
+
 ## S3 上传
 
-启用 `s3-storage` 插件并在后台“S3 存储”中开启后：
+从扩展商店安装并启用 `s3-storage` 插件，再在后台“S3 存储”中开启后：
 
 - 新附件会通过 AWS Signature V4 上传到 S3 或兼容服务。
 - 对象键格式为“路径前缀/年份/随机文件名”。
@@ -131,7 +143,7 @@ plugins/       功能插件与语言插件
 
 ## 邮件通知
 
-启用 `email-notifications` 插件后，可选择使用 SMTP；关闭 SMTP 时会尝试服务器 PHP `mail()`：
+从扩展商店安装并启用 `email-notifications` 插件后，可选择使用 SMTP；关闭 SMTP 时会尝试服务器 PHP `mail()`：
 
 - 忘记密码邮件会优先通过 SMTP 发送。
 - 新评论提交成功后，如站点设置里开启“新评论显示后台提醒”，会发送新评论通知邮件。
@@ -144,7 +156,7 @@ plugins/       功能插件与语言插件
 如果本机有 PHP：
 
 ```bash
-php -S 127.0.0.1:8000
+php -S 127.0.0.1:8000 router.php
 ```
 
 然后访问：
@@ -152,6 +164,8 @@ php -S 127.0.0.1:8000
 ```text
 http://127.0.0.1:8000/install.php
 ```
+
+必须带上 `router.php`，它会在 PHP 内置服务器下阻止浏览器访问 `data/`、`cache/`、隐藏文件和扩展中的非公开文件；不要直接使用不带路由脚本的 `php -S` 启动本站。
 
 ## 伪静态 URL
 
@@ -177,8 +191,8 @@ Apache 已可直接使用仓库里的 `.htaccess`。
 ```nginx
 location ^~ /data/ { deny all; }
 location ^~ /cache/ { deny all; }
-location ~* ^/themes/.+\.(?:php|json)$ { deny all; }
-location ~* ^/plugins/.+\.(?:php|json|md)$ { deny all; }
+location ~ (^|/)\. { deny all; }
+location ~* ^/(?:themes|plugins)/(?!.*\.(?:css|js|mjs|png|jpe?g|gif|webp|avif|svg|ico|eot|ttf|otf|woff2?|xml|webmanifest|mp3|ogg|wav|mp4|webm)$) { deny all; }
 
 location / {
     try_files $uri $uri/ /index.php?$query_string;
@@ -193,8 +207,10 @@ location ~ \.php$ {
 
 ## 注意
 
-- `data/` 和 `cache/` 不应该被公网直接访问
+- `data/`、`cache/`、隐藏文件和扩展中的非公开文件不应该被公网直接访问
 - `ai_settings`、`mail_settings` 和 `s3_settings` 中包含后端密钥类配置，请只通过后台修改
 - 如果要重装，先删除 `data/install.lock`
-- 更新程序后如涉及数据库结构变更，请先登录后台，再访问 `update.php` 执行升级
-- 一键更新会保留 `data/`、`cache/`、`uploads/`、用户自建主题和插件，递归合并发布包中的 `themes/` 与 `plugins/`，并将被覆盖的程序、主题与插件文件备份到 `cache/update-backup-*`。升级后若检测到内置主题或插件缺失，会自动再次读取当前 Release 补齐文件
+- 检查更新会读取 GitHub Release 正文中的数据库版本元数据；需要迁移时，后台会在更新前提示，并在升级完成前持续显示 `update.php` 入口
+- 每次发布都在 Release 正文加入 `<!-- sblog-release-meta: {"database_schema":1} -->`（数字使用该版本的目标 schema）；包含数据库迁移时，还需要同步递增程序中的数据库 schema 常量
+- 首次启用此机制的版本应作为不含新数据库迁移的桥接版本发布，因为更旧的更新器无法读取 Release 元数据
+- 一键更新只覆盖核心程序文件并保留 `data/`、`cache/`、`uploads/`、`themes/` 与 `plugins/`；主题和插件通过扩展商店独立更新
