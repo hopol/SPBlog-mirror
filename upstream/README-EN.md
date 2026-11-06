@@ -94,6 +94,7 @@ store/         Extension-store catalog protocol documentation (not deployed to t
 ## Configuration and Cache
 
 - The `settings` table stores basic site settings.
+- Password recovery and email notifications require a valid, complete **Site URL** under **Site Settings → General**. Include the full path for subdirectory installations. If the URL is missing or invalid, the application will not generate email links from the request hostname.
 - Legacy field, index, and data repairs run once and record `database_maintenance_version`; subsequent requests only read that version. Increment `DATABASE_MAINTENANCE_VERSION` when adding compatibility repairs. Running `update.php` schedules a fresh check on the next request.
 - **Language** under **Site Settings → General** is stored as `site_language` and defaults to `zh-CN` (Simplified Chinese). Installed language packs add options through the `locale` and `language_name` fields in their `plugin.json` manifest.
 - `cache/settings.php` caches basic site settings to reduce database reads on regular pages.
@@ -190,6 +191,8 @@ When pretty URLs are enabled in the admin panel, public pages and the main admin
 - `/edit/12`
 
 Apache can use the repository's `.htaccess` file directly.
+
+The upload directory's `.htaccess` uses only rewrite and response-header directives in the `FileInfo` override class, so restrictions on `Options` or `AuthConfig` do not cause image requests to return HTTP 500. After upgrading, visit the administration area once to replace the application's old generated rules automatically. Custom `.htaccess` files are preserved.
 
 For Nginx, use the following configuration as a starting point:
 

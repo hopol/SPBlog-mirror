@@ -1,5 +1,5 @@
-commit=031d4124285d6efc49f9d6e248901efd98f6209b
-timestamp=2026-10-31T07:49:56Z
+commit=505ff18dadcd19aeed5a41380e6624fb0e463c77
+timestamp=2026-11-06T08:49:30Z
 upstream_url=https://github.com/jkjoy/Simple-PHP-Blog
 upstream_branch=main
-source_ref=v1.14.19
+source_ref=v1.14.29

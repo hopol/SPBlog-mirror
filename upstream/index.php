@@ -23,7 +23,7 @@ session_set_cookie_params([
 ]);
 session_start();
 
-const APP_VERSION = 'v1.14.19';
+const APP_VERSION = 'v1.14.29';
 const DATABASE_SCHEMA_VERSION = 1;
 const DATABASE_MAINTENANCE_VERSION = 1;
 const DATA_DIR = __DIR__ . '/data';
@@ -76,6 +76,16 @@ function ensure_runtime_dirs(): void
 
     if (!is_dir(UPLOAD_DIR)) {
         mkdir(UPLOAD_DIR, 0755, true);
+    }
+
+    $htaccess = UPLOAD_DIR . '/.htaccess';
+    $legacyRules = "Options -ExecCGI\nRemoveHandler .php .phtml .php3 .php4 .php5 .php7 .php8 .phar .cgi .pl .py .rb .asp .aspx .jsp\n<IfModule mod_headers.c>\n  Header set X-Content-Type-Options nosniff\n</IfModule>\n<FilesMatch \"\\.(php|phtml|php3|php4|php5|php7|php8|phar|cgi|pl|py|rb|asp|aspx|jsp)$\">\n  Require all denied\n</FilesMatch>\n";
+    $currentRules = is_file($htaccess) ? file_get_contents($htaccess) : null;
+    if ($currentRules === null || (is_string($currentRules) && trim(str_replace(["\r\n", "\r"], "\n", $currentRules)) === trim($legacyRules))) {
+        $rules = "# SBlog upload protection\nRewriteEngine On\nRewriteRule (^|/)\\. - [F,L]\nRewriteRule \\.(?:php[0-9]*|phtml|phar|cgi|pl|py|rb|asp|aspx|jsp)(?:[./]|$) - [F,L,NC]\n<IfModule mod_headers.c>\n  Header set X-Content-Type-Options nosniff\n</IfModule>\n";
+        if (@file_put_contents($htaccess, $rules, LOCK_EX) === false) {
+            error_log('Unable to write SBlog upload protection: ' . $htaccess);
+        }
     }
 
     if (!is_dir(THEMES_DIR)) {
@@ -1388,12 +1398,16 @@ function install_release_files(string $source, string $targetRoot, string $backu
                 $created[] = $file;
             }
             if (!copy($from, $target)) { throw new RuntimeException(sblog_t('无法覆盖 {file}', ['file' => $file])); }
+            if (str_ends_with($file, '.php') && function_exists('opcache_invalidate')) { @opcache_invalidate($target, true); }
         }
     } catch (Throwable $exception) {
         foreach (array_reverse($created) as $file) { @unlink($targetRoot . '/' . $file); }
         foreach (array_reverse($replaced) as $file) {
             $saved = $backup . '/' . $file;
-            if (is_file($saved)) { copy($saved, $targetRoot . '/' . $file); }
+            if (is_file($saved)) {
+                copy($saved, $targetRoot . '/' . $file);
+                if (str_ends_with($file, '.php') && function_exists('opcache_invalidate')) { @opcache_invalidate($targetRoot . '/' . $file, true); }
+            }
         }
         foreach (array_reverse(array_unique($createdDirectories)) as $directory) {
             $current = $directory;
@@ -2096,7 +2110,7 @@ function login_rate_file(): string
 
 function login_rate_state(bool $recordFailure = false, bool $clear = false): array
 {
-    return authentication_rate_state(login_rate_file(), $recordFailure, $clear);
+    return authentication_rate_state(login_rate_file(), $recordFailure, $clear, 5);
 }
 
 function password_reset_rate_file(): string
@@ -2107,31 +2121,33 @@ function password_reset_rate_file(): string
 
 function password_reset_rate_state(bool $recordAttempt = false): array
 {
-    return authentication_rate_state(password_reset_rate_file(), $recordAttempt);
+    return authentication_rate_state(password_reset_rate_file(), $recordAttempt, false, 3);
 }
 
-function authentication_rate_state(string $file, bool $recordAttempt = false, bool $clear = false): array
+function authentication_rate_state(string $file, bool $recordAttempt = false, bool $clear = false, int $limit = 0): array
 {
     ensure_runtime_dirs();
-    $handle = fopen($file, 'c+');
-    if ($handle === false) { return ['count' => 0, 'since' => time()]; }
+    $unavailable = ['count' => $limit > 0 ? $limit : PHP_INT_MAX, 'since' => time(), 'allowed' => false];
+    $handle = @fopen($file, 'c+');
+    if ($handle === false) { return $unavailable; }
 
-    flock($handle, LOCK_EX);
+    if (!flock($handle, LOCK_EX)) { fclose($handle); return $unavailable; }
     $raw = stream_get_contents($handle);
+    if ($raw === false) { flock($handle, LOCK_UN); fclose($handle); return $unavailable; }
     $state = json_decode($raw ?: '', true);
     $now = time();
     if (!is_array($state) || $now - (int)($state['since'] ?? 0) >= 900) {
         $state = ['count' => 0, 'since' => $now];
     }
-    if ($recordAttempt) { $state['count'] = (int)$state['count'] + 1; }
+    $allowed = $limit < 1 || (int)($state['count'] ?? 0) < $limit;
+    if ($recordAttempt && $allowed) { $state['count'] = (int)($state['count'] ?? 0) + 1; }
     if ($clear) { $state = ['count' => 0, 'since' => $now]; }
-    ftruncate($handle, 0);
-    rewind($handle);
-    fwrite($handle, json_encode($state));
-    fflush($handle);
+    $encoded = json_encode($state);
+    $saved = @ftruncate($handle, 0) && rewind($handle)
+        && @fwrite($handle, $encoded) === strlen($encoded) && @fflush($handle);
     flock($handle, LOCK_UN);
     fclose($handle);
-    return $state;
+    return $saved ? $state + ['allowed' => $clear || $allowed] : $unavailable;
 }
 
 function public_ip_address(string $ip): bool
@@ -2158,12 +2174,6 @@ function ensure_upload_year_dir(): array
     $dir = UPLOAD_DIR . '/' . $year;
     if (!is_dir($dir)) {
         mkdir($dir, 0755, true);
-    }
-
-    $htaccess = UPLOAD_DIR . '/.htaccess';
-    $htaccessRules = "Options -ExecCGI\nRemoveHandler .php .phtml .php3 .php4 .php5 .php7 .php8 .phar .cgi .pl .py .rb .asp .aspx .jsp\n<IfModule mod_headers.c>\n  Header set X-Content-Type-Options nosniff\n</IfModule>\n<FilesMatch \"\\.(php|phtml|php3|php4|php5|php7|php8|phar|cgi|pl|py|rb|asp|aspx|jsp)$\">\n  Require all denied\n</FilesMatch>\n";
-    if (!is_file($htaccess) || file_get_contents($htaccess) !== $htaccessRules) {
-        file_put_contents($htaccess, $htaccessRules, LOCK_EX);
     }
 
     return [$year, $dir];
@@ -2987,7 +2997,7 @@ function theme_settings_schema(string $slug): array
             $key = is_string($field['key'] ?? null) ? $field['key'] : '';
             $type = is_string($field['type'] ?? null) ? $field['type'] : 'text';
             if (!preg_match('/^[a-z][a-z0-9_]{0,63}$/', $key) || isset($keys[$key]) || count($keys) >= 100
-                || !in_array($type, ['text', 'textarea', 'url', 'color', 'checkbox', 'select', 'date'], true)) { return []; }
+                || !in_array($type, ['text', 'textarea', 'url', 'color', 'checkbox', 'select', 'date', 'secret'], true)) { return []; }
             $keys[$key] = true;
             $text = static fn(string $name, string $fallback = ''): string => is_scalar($field[$name] ?? null)
                 ? (string)$field[$name] : $fallback;
@@ -3000,6 +3010,7 @@ function theme_settings_schema(string $slug): array
                 }
             }
             $default = $text('default', $type === 'checkbox' ? '0' : '');
+            if ($type === 'secret') { $default = ''; }
             if ($type === 'checkbox') { $default = in_array($default, ['1', 'true'], true) ? '1' : '0'; }
             $normalized = [
                 'key' => $key, 'type' => $type, 'label' => str_sub_u($text('label', $key), 0, 200),
@@ -3076,15 +3087,23 @@ function theme_setting(string $key, string $default = '', ?string $slug = null):
     return theme_settings($slug)[$key] ?? $default;
 }
 
-function theme_settings_values(string $slug, array $input): array
+function theme_settings_values(string $slug, array $input, array $clear = []): array
 {
     $values = [];
     $errors = [];
+    $stored = theme_settings($slug);
     foreach (theme_settings_schema($slug) as $section) {
         foreach ($section['fields'] as $field) {
             $key = $field['key'];
             $raw = $input[$key] ?? ($field['type'] === 'checkbox' ? '0' : '');
             $values[$key] = is_scalar($raw) ? trim((string)$raw) : '';
+            if ($field['type'] === 'secret' && is_scalar($raw)) {
+                if (($clear[$key] ?? null) === '1') {
+                    $values[$key] = '';
+                } elseif ($values[$key] === '') {
+                    $values[$key] = (string)($stored[$key] ?? '');
+                }
+            }
             $error = is_scalar($raw) ? theme_setting_value_error($field, $values[$key]) : sblog_t('请填写有效的内容。');
             if ($error !== '') { $errors[$key] = $error; }
         }
@@ -3165,6 +3184,12 @@ function load_active_theme(): void
             return $styleUrl !== '' ? '<link rel="stylesheet" href="' . h($styleUrl) . '">' . "\n" : '';
         }, -1000);
     }
+
+    // Standalone layouts skip index.css; reserve scrollbar space for every public theme.
+    // Keep the legacy fallback on body so theme overlays can still lock scrolling there.
+    add_theme_action('head', static function (array $context): string {
+        return '<style id="sblog-scrollbar-gutter">html{scrollbar-gutter:stable}@supports not (scrollbar-gutter:stable){body{overflow-y:scroll}}</style>' . "\n";
+    }, -900);
 }
 
 function use_pretty_url(): bool
@@ -3337,27 +3362,12 @@ function configured_site_root_url(): string
 function site_root_url(bool $trusted = false): string
 {
     $configured = configured_site_root_url();
-    if ($configured !== '') {
+    if ($configured !== '' || $trusted) {
         return $configured;
     }
 
     $scheme = request_is_https() ? 'https' : 'http';
-    if ($trusted) {
-        // Links that leave the request (emails) prefer the server-side name over the Host header.
-        // Note that Apache with `UseCanonicalName Off` copies SERVER_NAME from Host, so only a
-        // configured `site_url` makes these links fully reliable; the installer seeds it.
-        $host = strtolower(trim((string)($_SERVER['SERVER_NAME'] ?? '')));
-        if (preg_match('/^[a-z0-9.-]+$/', $host)) {
-            $port = (int)($_SERVER['SERVER_PORT'] ?? 0);
-            if ($port > 0 && $port !== ($scheme === 'https' ? 443 : 80)) {
-                $host .= ':' . $port;
-            }
-        } else {
-            $host = (string)($_SERVER['HTTP_HOST'] ?? 'localhost');
-        }
-    } else {
-        $host = (string)($_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost');
-    }
+    $host = (string)($_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? 'localhost');
 
     return rtrim($scheme . '://' . $host . app_base_path(), '/');
 }
@@ -3369,6 +3379,9 @@ function absolute_url(string $path, bool $trusted = false): string
     }
 
     $base = site_root_url($trusted);
+    if ($base === '') {
+        return '';
+    }
     $appBase = app_base_path();
 
     if ($appBase !== '') {
@@ -5050,16 +5063,22 @@ function render_public_post_list(array $posts): string
     return (string)ob_get_clean();
 }
 
-function fetch_admin_posts(): array
+function fetch_admin_posts(int $requestedPage = 1): array
 {
-    return all_rows(
+    $total = (int)val('SELECT COUNT(*) FROM posts');
+    $totalPages = max(1, (int)ceil($total / 12));
+    $page = max(1, min($totalPages, $requestedPage));
+    $offset = ($page - 1) * 12;
+    $posts = all_rows(
         "SELECT p.*, c.name AS category_name
          FROM posts p
          LEFT JOIN categories c ON c.id = p.category_id
          ORDER BY
             CASE WHEN p.status = 'published' THEN p.published_at ELSE p.updated_at END DESC,
-            p.id DESC"
+            p.id DESC
+         LIMIT 12 OFFSET {$offset}"
     );
+    return [$posts, $total, $page, $totalPages];
 }
 
 function admin_metrics(): array
@@ -5380,7 +5399,11 @@ function send_comment_reply_notice(int $commentId): void
     }
 
     $siteName = setting('site_name', default_settings()['site_name']);
-    $url = absolute_url(content_permalink(['kind' => (string)$reply['post_kind'], 'slug' => (string)$reply['post_slug']]), true) . '#comment-' . $commentId;
+    $url = absolute_url(content_permalink(['kind' => (string)$reply['post_kind'], 'slug' => (string)$reply['post_slug']]), true);
+    if ($url === '') {
+        return;
+    }
+    $url .= '#comment-' . $commentId;
     $subject = sblog_t('[{site}] {author} 回复了你的评论', [
         'site' => $siteName,
         'author' => (string)$reply['author_name'],
@@ -6198,7 +6221,7 @@ function admin_icon(string $name): string
         'overview' => '<rect x="3" y="3" width="7" height="9" rx="1"></rect><rect x="14" y="3" width="7" height="5" rx="1"></rect><rect x="14" y="12" width="7" height="9" rx="1"></rect><rect x="3" y="16" width="7" height="5" rx="1"></rect>',
         'home' => '<path d="M3 10.5 12 3l9 7.5"></path><path d="M5 10v10h14V10"></path><path d="M9 20v-6h6v6"></path>',
         'write' => '<path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"></path>',
-        'media' => '<rect x="3" y="4" width="18" height="16" rx="2"></rect><circle cx="8.5" cy="9" r="1.5"></circle><path d="m21 15-5-5L5 20"></path><path d="m14 14-2-2-6 6"></path>',
+        'media' => '<path d="M3 7v12a2 2 0 0 0 2 2h12"></path><rect x="7" y="3" width="14" height="14" rx="2"></rect><path d="m12 7 5 3-5 3z"></path>',
         'posts' => '<path d="M8 6h13"></path><path d="M8 12h13"></path><path d="M8 18h13"></path><path d="M3 6h.01"></path><path d="M3 12h.01"></path><path d="M3 18h.01"></path>',
         'comments' => '<path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4v8z"></path><path d="M8 9h8"></path><path d="M8 13h5"></path>',
         'bell' => '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"></path><path d="M10 21h4"></path>',
@@ -7140,6 +7163,9 @@ function create_password_reset(array $user): array
 function send_password_reset_notice(array $user, string $token, int $expiresAt): bool
 {
     $link = absolute_url(url_with_query(url_for('reset_password'), ['token' => $token]), true);
+    if ($link === '') {
+        return false;
+    }
     $siteName = setting('site_name', default_settings()['site_name']);
     $subject = sblog_t('重置 {site} 管理员密码', ['site' => $siteName]);
     $body = sblog_t(
@@ -7164,7 +7190,8 @@ function comment_notify_email(): string
 function send_comment_notification(array $post, array $comment, string $status): bool
 {
     $email = comment_notify_email();
-    if ($email === '') {
+    $link = absolute_url(content_permalink($post), true);
+    if ($email === '' || $link === '') {
         return false;
     }
 
@@ -7179,7 +7206,7 @@ function send_comment_notification(array $post, array $comment, string $status):
             'author' => (string)$comment['author_name'],
             'email' => (string)$comment['author_email'],
             'ip' => client_ip_address() ?: sblog_t('未知'),
-            'link' => absolute_url(content_permalink($post), true) . '#comments',
+            'link' => $link . '#comments',
             'content' => (string)$comment['content'],
         ]
     );
@@ -7362,7 +7389,7 @@ function render_admin_page(): void
                   <?php if (!$updateDatabaseKnown): ?><p class="update-notice__warning"><?= h(sblog_t('此版本未声明数据库升级信息，请在更新后检查发布说明和后台提示。')) ?></p><?php endif; ?>
                   <?php if ($updateDatabaseIncompatible): ?><p class="update-notice__warning"><?= h(sblog_t('此更新声明的数据库版本低于当前环境，已禁止安装。')) ?></p><?php endif; ?>
                 </div>
-                <form method="post" action="<?= h(url_for('install_update')) ?>" onsubmit="return confirm(<?= h(json_encode($updateConfirmation, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                <form method="post" action="<?= h(url_for('install_update')) ?>" data-core-update data-confirm="<?= h($updateConfirmation) ?>">
                   <?= csrf_field() ?>
                   <input type="hidden" name="expected_version" value="<?= h($update['latest']) ?>">
                   <input type="hidden" name="expected_database_schema_known" value="<?= $updateDatabaseKnown ? '1' : '0' ?>">
@@ -7548,14 +7575,16 @@ function render_admin_posts_page(): void
 {
     require_admin();
 
-    $posts = fetch_admin_posts();
+    $requestedPage = is_scalar($_GET['p'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_GET['p']) === 1 ? (int)$_GET['p'] : 1;
+    [$posts, $total, $page, $totalPages] = fetch_admin_posts($requestedPage);
+    $pageNumbers = array_values(array_unique(array_merge([1], range(max(1, $page - 1), min($totalPages, $page + 1)), [$totalPages])));
     $sidebar = render_admin_sidebar('posts');
 
     ob_start();
     ?>
     <?= render_admin_content_start(sblog_t('文章管理'), $sidebar) ?>
 
-        <section class="panel admin-list-panel admin-animate admin-animate--2">
+        <section class="panel admin-list-panel post-manager admin-animate admin-animate--2">
           <div class="panel__header">
             <div class="admin-head">
               <div class="admin-head-left">
@@ -7567,15 +7596,15 @@ function render_admin_posts_page(): void
           </div>
           <div class="panel__body panel__body--flush">
             <?php if ($posts): ?>
-              <div class="table-wrap">
-                <table class="admin-table">
+              <div class="table-wrap post-table-wrap">
+                <table class="admin-table post-table" role="table">
                   <thead>
                   <tr>
-                    <th><?= h(sblog_t('类型')) ?></th>
-                    <th><?= h(sblog_t('标题')) ?></th>
-                    <th><?= h(sblog_t('状态')) ?></th>
-                    <th><?= h(sblog_t('更新时间')) ?></th>
-                    <th><?= h(sblog_t('操作')) ?></th>
+                    <th scope="col"><?= h(sblog_t('类型')) ?></th>
+                    <th scope="col"><?= h(sblog_t('标题')) ?></th>
+                    <th scope="col"><?= h(sblog_t('状态')) ?></th>
+                    <th scope="col"><?= h(sblog_t('更新时间')) ?></th>
+                    <th scope="col"><?= h(sblog_t('操作')) ?></th>
                   </tr>
                   </thead>
                   <tbody>
@@ -7585,16 +7614,16 @@ function render_admin_posts_page(): void
                     $isPinned = !empty($post['is_pinned']) && content_kind($post) === 'post';
                     ?>
                     <tr class="admin-post-row<?= $isPinned ? ' admin-post-row--pinned' : '' ?>">
-                      <td><span class="content-kind content-kind--<?= h(content_kind($post)) ?>"><?= h(content_type_label($post)) ?></span></td>
-                      <td>
+                      <td class="post-table__kind"><span class="content-kind content-kind--<?= h(content_kind($post)) ?>"><?= h(content_type_label($post)) ?></span></td>
+                      <td class="post-table__title">
                         <div class="table-title admin-post-title">
                           <strong><a href="<?= h(url_for('edit', ['id' => $post['id']])) ?>"><?= h($post['title']) ?></a></strong>
                           <?php if ($isPinned): ?><span class="admin-pinned-badge"><?= admin_icon('pin') ?><?= h(sblog_t('置顶')) ?></span><?php endif; ?>
                         </div>
                       </td>
-                      <td><span class="status-badge status-badge--<?= h($state['class']) ?>"><?= h($state['label']) ?></span></td>
-                      <td><time datetime="<?= h(date(DATE_ATOM, (int)$post['updated_at'])) ?>"><?= h(pretty_date((int)$post['updated_at'], true)) ?></time></td>
-                      <td>
+                      <td class="post-table__status"><span class="status-badge status-badge--<?= h($state['class']) ?>"><?= h($state['label']) ?></span></td>
+                      <td class="post-table__updated" data-label="<?= h(sblog_t('更新时间')) ?>"><time datetime="<?= h(date(DATE_ATOM, (int)$post['updated_at'])) ?>"><?= h(pretty_date((int)$post['updated_at'], true)) ?></time></td>
+                      <td class="post-table__actions">
                         <div class="table-actions">
                           <a class="button button--ghost" href="<?= h(content_permalink($post)) ?>"><?= h(sblog_t('查看')) ?></a>
                           <a class="button button--ghost" href="<?= h(url_for('edit', ['id' => $post['id']])) ?>"><?= h(sblog_t('编辑')) ?></a>
@@ -7602,11 +7631,13 @@ function render_admin_posts_page(): void
                             <?= csrf_field() ?>
                             <input type="hidden" name="id" value="<?= h($post['id']) ?>">
                             <input type="hidden" name="status" value="<?= h((string)$post['status'] === 'published' ? 'draft' : 'published') ?>">
+                            <input type="hidden" name="return_page" value="<?= $page ?>">
                             <button class="button button--ghost" type="submit"><?= h((string)$post['status'] === 'published' ? sblog_t('转草稿') : sblog_t('发布')) ?></button>
                           </form>
-                          <form method="post" action="<?= h(url_for('delete_post')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定删除这篇文章吗？'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                          <form method="post" action="<?= h(url_for('delete_post')) ?>" data-confirm="<?= h(sblog_t('确定删除这篇文章吗？')) ?>">
                             <?= csrf_field() ?>
                             <input type="hidden" name="id" value="<?= h($post['id']) ?>">
+                            <input type="hidden" name="return_page" value="<?= $page ?>">
                             <button class="button button--danger" type="submit"><?= h(sblog_t('删除')) ?></button>
                           </form>
                         </div>
@@ -7615,6 +7646,21 @@ function render_admin_posts_page(): void
                   <?php endforeach; ?>
                   </tbody>
                 </table>
+              </div>
+              <div class="admin-table-footer">
+                <span><?= h(sblog_t('第 {page} / {pages} 页', ['page' => $page, 'pages' => $totalPages])) ?></span>
+                <nav class="admin-pagination" aria-label="<?= h(sblog_t('文章分页')) ?>">
+                  <?php if ($page > 1): ?><a class="button button--secondary" rel="prev" href="<?= h(url_with_query(url_for('admin_posts'), ['p' => $page - 1])) ?>"><?= h(sblog_t('上一页')) ?></a><?php endif; ?>
+                  <?php $previousPage = 0; foreach ($pageNumbers as $number): ?>
+                    <?php if ($previousPage > 0 && $number > $previousPage + 1): ?><span aria-hidden="true">…</span><?php endif; ?>
+                    <?php if ($number === $page): ?>
+                      <span aria-current="page" aria-label="<?= h(sblog_t('第 {page} 页', ['page' => $number])) ?>"><?= $number ?></span>
+                    <?php else: ?>
+                      <a href="<?= h(url_with_query(url_for('admin_posts'), ['p' => $number])) ?>" aria-label="<?= h(sblog_t('第 {page} 页', ['page' => $number])) ?>"><?= $number ?></a>
+                    <?php endif; ?>
+                  <?php $previousPage = $number; endforeach; ?>
+                  <?php if ($page < $totalPages): ?><a class="button button--secondary" rel="next" href="<?= h(url_with_query(url_for('admin_posts'), ['p' => $page + 1])) ?>"><?= h(sblog_t('下一页')) ?></a><?php endif; ?>
+                </nav>
               </div>
             <?php else: ?>
               <div class="empty-state empty-state--inside">
@@ -7657,7 +7703,7 @@ function render_admin_comments_page(): void
     ?>
     <?= render_admin_content_start(sblog_t('评论管理'), $sidebar) ?>
 
-        <section class="panel admin-list-panel admin-animate admin-animate--2">
+        <section class="panel admin-list-panel comment-manager admin-animate admin-animate--2">
           <div class="panel__header">
             <div class="admin-head">
               <div class="admin-head-left">
@@ -7695,16 +7741,17 @@ function render_admin_comments_page(): void
 
           <div class="panel__body panel__body--flush">
             <?php if ($comments): ?>
-              <div class="table-wrap">
-                <table class="admin-table comment-table">
+              <div class="table-wrap comment-table-wrap">
+                <table class="admin-table comment-table" role="table">
                   <thead>
                     <tr>
-                      <th><label class="table-check"><input type="checkbox" data-check-all="comment_ids[]" aria-label="<?= h(sblog_t('全选评论')) ?>"><span class="sr-only"><?= h(sblog_t('全选')) ?></span></label></th>
-                      <th><?= h(sblog_t('评论者')) ?></th>
-                      <th><?= h(sblog_t('内容与文章')) ?></th>
-                      <th><?= h(sblog_t('状态')) ?></th>
-                      <th><?= h(sblog_t('提交时间')) ?></th>
-                      <th><?= h(sblog_t('操作')) ?></th>
+                      <th scope="col"><label class="table-check"><input type="checkbox" data-check-all="comment_ids[]" aria-label="<?= h(sblog_t('全选评论')) ?>"><span class="comment-select-all-text"><?= h(sblog_t('全选评论')) ?></span></label></th>
+                      <th scope="col"><?= h(sblog_t('评论者')) ?></th>
+                      <th scope="col"><?= h(sblog_t('内容')) ?></th>
+                      <th scope="col"><?= h(sblog_t('文章')) ?></th>
+                      <th scope="col"><?= h(sblog_t('状态')) ?></th>
+                      <th scope="col"><?= h(sblog_t('提交时间')) ?></th>
+                      <th scope="col"><?= h(sblog_t('操作')) ?></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -7712,28 +7759,32 @@ function render_admin_comments_page(): void
                       <?php $state = comment_status_meta((string)$comment['status']); ?>
                       <?php $authorUrl = safe_link_url((string)$comment['author_url']); ?>
                       <tr class="comment-row<?= (int)$comment['is_read'] === 0 ? ' is-unread' : '' ?>">
-                        <td><label class="table-check"><input type="checkbox" name="comment_ids[]" value="<?= h($comment['id']) ?>" form="comments-bulk-form" aria-label="<?= h(sblog_t('选择 {author} 的评论', ['author' => (string)$comment['author_name']])) ?>"><span class="sr-only"><?= h(sblog_t('选择评论')) ?></span></label></td>
-                        <td>
+                        <td class="comment-table__select"><label class="table-check"><input type="checkbox" name="comment_ids[]" value="<?= h($comment['id']) ?>" form="comments-bulk-form" aria-label="<?= h(sblog_t('选择 {author} 的评论', ['author' => (string)$comment['author_name']])) ?>"><span class="sr-only"><?= h(sblog_t('选择评论')) ?></span></label></td>
+                        <td class="comment-table__author">
                           <div class="table-title">
-                            <strong><?= h($comment['author_name']) ?></strong>
-                            <span><?= h($comment['author_email']) ?></span>
-                            <?php if ((string)$comment['ip_address'] !== ''): ?><span><?= h(sblog_t('IP：{address}', ['address' => (string)$comment['ip_address']])) ?></span><?php endif; ?>
-                            <?php if ($authorUrl !== '#'): ?><a href="<?= h($authorUrl) ?>" target="_blank" rel="noopener noreferrer nofollow"><?= h((string)parse_url($authorUrl, PHP_URL_HOST)) ?></a><?php endif; ?>
+                            <strong class="comment-author__name" title="<?= h($comment['author_name']) ?>"><?php if ($authorUrl !== '#'): ?><a href="<?= h($authorUrl) ?>" target="_blank" rel="noopener noreferrer nofollow"><?= h($comment['author_name']) ?></a><?php else: ?><?= h($comment['author_name']) ?><?php endif; ?></strong>
+                            <span class="comment-author__email" title="<?= h($comment['author_email']) ?>"><?= h($comment['author_email']) ?></span>
+                            <?php if ((string)$comment['ip_address'] !== ''): ?><span class="comment-author__ip" title="<?= h(sblog_t('IP：{address}', ['address' => (string)$comment['ip_address']])) ?>"><?= h(sblog_t('IP：{address}', ['address' => (string)$comment['ip_address']])) ?></span><?php endif; ?>
+                            <?php if ($authorUrl !== '#'): ?><a class="comment-author__website" href="<?= h($authorUrl) ?>" target="_blank" rel="noopener noreferrer nofollow"><?= h((string)parse_url($authorUrl, PHP_URL_HOST)) ?></a><?php endif; ?>
                           </div>
                         </td>
-                        <td>
+                        <td class="comment-table__content">
                           <div class="comment-summary">
                             <?php if (trim((string)$comment['reply_to_name']) !== ''): ?><span class="comment-summary__reply"><?= h(sblog_t('回复 @{name}', ['name' => (string)$comment['reply_to_name']])) ?></span><?php endif; ?>
                             <p><?= h(comment_excerpt((string)$comment['content'])) ?></p>
-                            <a href="<?= h(content_permalink(['kind' => (string)$comment['post_kind'], 'slug' => (string)$comment['post_slug']])) ?><?= (string)$comment['status'] === 'approved' && (string)$comment['post_kind'] === 'post' ? '#comment-' . h($comment['id']) : '' ?>"><?= h($comment['post_title']) ?></a>
                           </div>
                         </td>
-                        <td>
+                        <td class="comment-table__post">
+                          <a class="comment-context" href="<?= h(content_permalink(['kind' => (string)$comment['post_kind'], 'slug' => (string)$comment['post_slug']])) ?><?= (string)$comment['status'] === 'approved' && (string)$comment['post_kind'] === 'post' ? '#comment-' . h($comment['id']) : '' ?>" title="<?= h($comment['post_title']) ?>"><?= h($comment['post_title']) ?></a>
+                        </td>
+                        <td class="comment-table__status" title="<?= h($state['label']) ?>">
                           <span class="status-badge status-badge--<?= h($state['class']) ?>"><?= h($state['label']) ?></span>
                           <?php if ((int)$comment['is_read'] === 0): ?><span class="comment-unread-dot"><?= h(sblog_t('未读')) ?></span><?php endif; ?>
                         </td>
-                        <td><time datetime="<?= h(date(DATE_ATOM, (int)$comment['created_at'])) ?>"><?= h(pretty_date((int)$comment['created_at'], true)) ?></time></td>
-                        <td>
+                        <td class="comment-table__time">
+                          <time datetime="<?= h(date(DATE_ATOM, (int)$comment['created_at'])) ?>" title="<?= h(pretty_date((int)$comment['created_at'], true)) ?>"><?= h(pretty_date((int)$comment['created_at'], true)) ?></time>
+                        </td>
+                        <td class="comment-table__actions">
                           <form class="table-actions comment-actions" method="post" action="<?= h(url_for('moderate_comments')) ?>">
                             <?= csrf_field() ?>
                             <input type="hidden" name="comment_id" value="<?= h($comment['id']) ?>">
@@ -7744,7 +7795,7 @@ function render_admin_comments_page(): void
                             <?php if ((string)$comment['status'] === 'approved'): ?><button class="button button--ghost" name="action" value="pending" type="submit"><?= h(sblog_t('撤下')) ?></button><?php endif; ?>
                             <?php if ((string)$comment['status'] !== 'spam'): ?><button class="button button--ghost" name="action" value="spam" type="submit"><?= h(sblog_t('垃圾')) ?></button><?php endif; ?>
                             <?php if ((int)$comment['is_read'] === 0): ?><button class="button button--ghost" name="action" value="read" type="submit"><?= h(sblog_t('已读')) ?></button><?php endif; ?>
-                            <button class="button button--danger" name="action" value="delete" type="submit" onclick="return confirm(<?= h(json_encode(sblog_t('确定永久删除这条评论吗？'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);"><?= h(sblog_t('删除')) ?></button>
+                            <button class="button button--danger" name="action" value="delete" type="submit" data-confirm="<?= h(sblog_t('确定永久删除这条评论吗？')) ?>"><?= h(sblog_t('删除')) ?></button>
                           </form>
                         </td>
                       </tr>
@@ -7754,7 +7805,7 @@ function render_admin_comments_page(): void
               </div>
 
               <div class="admin-table-footer">
-                <form id="comments-bulk-form" class="comment-bulk-form" method="post" action="<?= h(url_for('moderate_comments')) ?>" onsubmit="return this.elements.action.value !== 'delete' || confirm(<?= h(json_encode(sblog_t('确定永久删除选中的评论吗？'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                <form id="comments-bulk-form" class="comment-bulk-form" method="post" action="<?= h(url_for('moderate_comments')) ?>" data-confirm-action="delete" data-confirm="<?= h(sblog_t('确定永久删除选中的评论吗？')) ?>">
                   <?= csrf_field() ?>
                   <input type="hidden" name="filter" value="<?= h($filter) ?>">
                   <input type="hidden" name="q" value="<?= h($search) ?>">
@@ -7846,7 +7897,7 @@ function render_admin_categories_page(array $form = [], array $errors = []): voi
                         <td>
                           <div class="table-actions">
                             <a class="button button--ghost" href="<?= h(url_with_query(url_for('admin_categories'), ['id' => (int)$category['id']])) ?>"><?= h(sblog_t('编辑')) ?></a>
-                            <form method="post" action="<?= h(url_for('delete_category')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定删除这个空分类吗？'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                            <form method="post" action="<?= h(url_for('delete_category')) ?>" data-confirm="<?= h(sblog_t('确定删除这个空分类吗？')) ?>">
                               <?= csrf_field() ?>
                               <input type="hidden" name="id" value="<?= h($category['id']) ?>">
                               <button class="button button--danger" type="submit"><?= h(sblog_t('删除')) ?></button>
@@ -7929,7 +7980,7 @@ function render_admin_links_page(array $form = [], array $errors = []): void
       <div class="admin-grid admin-grid--split">
         <section class="panel admin-list-panel"><div class="panel__header"><h2><?= h(sblog_t('链接列表')) ?></h2><p class="panel__meta"><?= h(sblog_t('排序数字越小越靠前。')) ?></p></div><div class="panel__body panel__body--flush">
           <?php if ($links): ?><div class="table-wrap"><table class="admin-table"><thead><tr><th><?= h(sblog_t('名称')) ?></th><th><?= h(sblog_t('网址')) ?></th><th><?= h(sblog_t('排序')) ?></th><th><?= h(sblog_t('操作')) ?></th></tr></thead><tbody>
-          <?php foreach ($links as $link): ?><tr><td><div class="table-title"><strong><?= h($link['name']) ?></strong><span><?= h($link['description']) ?></span></div></td><td><a href="<?= h($link['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h($link['url']) ?></a></td><td><?= h($link['sort_order']) ?></td><td><div class="table-actions"><a class="button button--ghost" href="<?= h(url_with_query(url_for('admin_links'), ['id' => (int)$link['id']])) ?>"><?= h(sblog_t('编辑')) ?></a><form method="post" action="<?= h(url_for('delete_link')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定删除这个链接吗？'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);"><?= csrf_field() ?><input type="hidden" name="id" value="<?= h($link['id']) ?>"><button class="button button--danger" type="submit"><?= h(sblog_t('删除')) ?></button></form></div></td></tr><?php endforeach; ?>
+          <?php foreach ($links as $link): ?><tr><td><div class="table-title"><strong><?= h($link['name']) ?></strong><span><?= h($link['description']) ?></span></div></td><td><a href="<?= h($link['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h($link['url']) ?></a></td><td><?= h($link['sort_order']) ?></td><td><div class="table-actions"><a class="button button--ghost" href="<?= h(url_with_query(url_for('admin_links'), ['id' => (int)$link['id']])) ?>"><?= h(sblog_t('编辑')) ?></a><form method="post" action="<?= h(url_for('delete_link')) ?>" data-confirm="<?= h(sblog_t('确定删除这个链接吗？')) ?>"><?= csrf_field() ?><input type="hidden" name="id" value="<?= h($link['id']) ?>"><button class="button button--danger" type="submit"><?= h(sblog_t('删除')) ?></button></form></div></td></tr><?php endforeach; ?>
           </tbody></table></div><?php else: ?><div class="empty-state empty-state--inside"><p><?= h(sblog_t('还没有友情链接。')) ?></p></div><?php endif; ?>
         </div></section>
         <section class="panel admin-list-panel"><div class="panel__header"><h2><?= h($editing ? sblog_t('编辑链接') : sblog_t('添加链接')) ?></h2></div><div class="panel__body">
@@ -7993,7 +8044,7 @@ function render_admin_tags_page(array $form = [], array $errors = []): void
             </div>
             <div class="panel__body">
               <?php if ($tags): ?>
-                <form class="tag-cloud-form" method="post" action="<?= h(url_for('delete_tag')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定删除选中的标签吗？文章本身不会被删除。'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                <form class="tag-cloud-form" method="post" action="<?= h(url_for('delete_tag')) ?>" data-confirm="<?= h(sblog_t('确定删除选中的标签吗？文章本身不会被删除。')) ?>">
                   <?= csrf_field() ?>
                   <div class="tag-cloud__toolbar">
                     <button class="button button--secondary tag-cloud__select-all" type="button" data-tag-check-all aria-pressed="false"><?= h(sblog_t('全选')) ?></button>
@@ -8193,7 +8244,7 @@ function render_admin_media_page(): void
                   <div class="media-library-actions">
                     <a class="button button--ghost" href="<?= h($media['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h(sblog_t('打开')) ?></a>
                     <a class="button button--ghost" href="<?= h(url_with_query(url_for('admin_media'), ['id' => (int)$media['id']])) ?>#media-editor"><?= h(sblog_t('编辑')) ?></a>
-                    <form method="post" action="<?= h(url_for('delete_media')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('删除此媒体资料？文件将被永久删除。'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);"><?= csrf_field() ?><input type="hidden" name="id" value="<?= h($media['id']) ?>"><button class="button button--danger" type="submit"><?= h(sblog_t('删除')) ?></button></form>
+                    <form method="post" action="<?= h(url_for('delete_media')) ?>" data-confirm="<?= h(sblog_t('删除此媒体资料？文件将被永久删除。')) ?>"><?= csrf_field() ?><input type="hidden" name="id" value="<?= h($media['id']) ?>"><button class="button button--danger" type="submit"><?= h(sblog_t('删除')) ?></button></form>
                   </div>
                 </article>
               <?php endforeach; ?>
@@ -8206,17 +8257,39 @@ function render_admin_media_page(): void
     render_admin_content_end(sblog_t('媒体库'), 'media', sblog_t('媒体资料管理'));
 }
 
+function extension_store_search_query(mixed $value): string
+{
+    if (!is_string($value)) {
+        return '';
+    }
+    return preg_match('/\A.{0,255}/us', trim($value), $match) === 1 ? $match[0] : '';
+}
+
 function render_admin_store_page(): void
 {
     require_admin();
 
-    $filter = strtolower(trim((string)($_GET['type'] ?? 'all')));
+    $filter = is_string($_GET['type'] ?? null) ? strtolower(trim($_GET['type'])) : 'all';
     if (!in_array($filter, ['all', 'theme', 'plugin'], true)) {
         $filter = 'all';
     }
-    $catalog = extension_store_catalog((string)($_GET['refresh'] ?? '') === '1');
+    $search = extension_store_search_query($_GET['q'] ?? null);
+    $pattern = $search !== '' ? '/' . preg_quote($search, '/') . '/iu' : '';
+    $catalog = extension_store_catalog(($_GET['refresh'] ?? '') === '1');
     $extensions = is_array($catalog['extensions'] ?? null) ? $catalog['extensions'] : [];
-    $visible = array_filter($extensions, static fn(array $extension): bool => $filter === 'all' || $extension['type'] === $filter);
+    $visible = array_filter($extensions, static function (array $extension) use ($filter, $pattern): bool {
+        if ($filter !== 'all' && $extension['type'] !== $filter) {
+            return false;
+        }
+        return $pattern === '' || preg_match($pattern, implode("\n", [
+            $extension['name'], $extension['slug'], $extension['description'], $extension['author'],
+        ])) === 1;
+    });
+    $total = count($visible);
+    $totalPages = max(1, (int)ceil($total / 12));
+    $requestedPage = is_scalar($_GET['p'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_GET['p']) === 1 ? (int)$_GET['p'] : 1;
+    $page = max(1, min($totalPages, $requestedPage));
+    $visible = array_slice($visible, ($page - 1) * 12, 12, true);
     $activeTheme = active_theme_slug();
     $activePlugins = active_plugin_slugs(true);
     $sidebar = render_admin_sidebar('store');
@@ -8232,7 +8305,7 @@ function render_admin_store_page(): void
               <h1 id="extension-store-title"><?= h(sblog_t('扩展商店')) ?></h1>
               <p><?= h(sblog_t('从远程商店安装和更新 SBlog 主题与插件。')) ?></p>
             </div>
-            <a class="button button--secondary" href="<?= h(url_with_query($storeUrl, ['type' => $filter, 'refresh' => 1])) ?>"><?= admin_icon('refresh') ?><?= h(sblog_t('刷新列表')) ?></a>
+            <a class="button button--secondary" href="<?= h(url_with_query($storeUrl, ['type' => $filter, 'q' => $search, 'p' => $page, 'refresh' => 1])) ?>"><?= admin_icon('refresh') ?><?= h(sblog_t('刷新列表')) ?></a>
           </header>
 
           <?php if ((string)($catalog['error'] ?? '') !== ''): ?>
@@ -8245,10 +8318,18 @@ function render_admin_store_page(): void
           <div class="extension-store__toolbar">
             <nav class="extension-store__tabs" aria-label="<?= h(sblog_t('扩展类型')) ?>">
               <?php foreach (['all' => sblog_t('全部'), 'theme' => sblog_t('主题'), 'plugin' => sblog_t('插件')] as $type => $label): ?>
-                <a href="<?= h(url_with_query($storeUrl, ['type' => $type])) ?>"<?= $filter === $type ? ' aria-current="page"' : '' ?>><?= h($label) ?></a>
+                <a href="<?= h(url_with_query($storeUrl, ['type' => $type, 'q' => $search])) ?>"<?= $filter === $type ? ' aria-current="page"' : '' ?>><?= h($label) ?></a>
               <?php endforeach; ?>
             </nav>
-            <span class="extension-store__count"><?= h(sblog_tn('{count} 个扩展', count($visible))) ?></span>
+            <form class="extension-store__search" method="get" action="<?= h($storeUrl) ?>" role="search">
+              <?php if (!use_pretty_url()): ?><input type="hidden" name="a" value="admin_store"><?php endif; ?>
+              <input type="hidden" name="type" value="<?= h($filter) ?>">
+              <label class="sr-only" for="extension-search"><?= h(sblog_t('搜索扩展')) ?></label>
+              <input id="extension-search" name="q" type="search" value="<?= h($search) ?>" maxlength="255" placeholder="<?= h(sblog_t('名称、标识、描述或作者')) ?>">
+              <button class="button button--secondary" type="submit"><?= h(sblog_t('搜索')) ?></button>
+              <?php if ($search !== ''): ?><a class="button button--ghost" href="<?= h(url_with_query($storeUrl, ['type' => $filter])) ?>"><?= h(sblog_t('清除搜索')) ?></a><?php endif; ?>
+            </form>
+            <span class="extension-store__count"><?= h(sblog_tn('{count} 个扩展', $total)) ?></span>
           </div>
 
           <?php if ($visible): ?>
@@ -8297,6 +8378,8 @@ function render_admin_store_page(): void
                           <input type="hidden" name="type" value="<?= h($type) ?>">
                           <input type="hidden" name="slug" value="<?= h($slug) ?>">
                           <input type="hidden" name="return_type" value="<?= h($filter) ?>">
+                          <input type="hidden" name="return_q" value="<?= h($search) ?>">
+                          <input type="hidden" name="return_page" value="<?= $page ?>">
                           <input type="hidden" name="return_to" value="store">
                           <button class="button" type="submit"><?= h($actionLabel) ?></button>
                         </form>
@@ -8306,8 +8389,15 @@ function render_admin_store_page(): void
                 </article>
               <?php endforeach; ?>
             </div>
+            <?php if ($totalPages > 1): ?>
+              <nav class="admin-pagination" aria-label="<?= h(sblog_t('扩展商店分页')) ?>">
+                <?php if ($page > 1): ?><a class="button button--secondary" rel="prev" href="<?= h(url_with_query($storeUrl, ['type' => $filter, 'q' => $search, 'p' => $page - 1])) ?>"><?= h(sblog_t('上一页')) ?></a><?php endif; ?>
+                <span><?= h(sblog_t('第 {page} / {pages} 页', ['page' => $page, 'pages' => $totalPages])) ?></span>
+                <?php if ($page < $totalPages): ?><a class="button button--secondary" rel="next" href="<?= h(url_with_query($storeUrl, ['type' => $filter, 'q' => $search, 'p' => $page + 1])) ?>"><?= h(sblog_t('下一页')) ?></a><?php endif; ?>
+              </nav>
+            <?php endif; ?>
           <?php else: ?>
-            <div class="empty-state extension-store__empty"><p><?= h((string)($catalog['error'] ?? '') !== '' ? sblog_t('无法获取扩展列表，请稍后刷新。') : sblog_t('当前分类暂无可用扩展。')) ?></p></div>
+            <div class="empty-state extension-store__empty"><p><?= h(!$extensions && (string)($catalog['error'] ?? '') !== '' ? sblog_t('无法获取扩展列表，请稍后刷新。') : ($search !== '' ? sblog_t('没有匹配的扩展，请尝试其他关键字。') : sblog_t('当前分类暂无可用扩展。'))) ?></p></div>
           <?php endif; ?>
 
           <p class="extension-store__trust"><?= h(sblog_t('主题和插件会在服务器上执行代码。仅安装来自可信商店的扩展。')) ?></p>
@@ -8323,6 +8413,10 @@ function render_admin_plugins_page(): void
     $plugins = available_plugins();
     $updateState = extension_updates_for('plugin', $plugins, (string)($_GET['check_updates'] ?? '') === '1');
     $updates = $updateState['items'];
+    $totalPages = max(1, (int)ceil(count($plugins) / 12));
+    $requestedPage = is_scalar($_GET['p'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_GET['p']) === 1 ? (int)$_GET['p'] : 1;
+    $page = max(1, min($totalPages, $requestedPage));
+    $visiblePlugins = array_slice($plugins, ($page - 1) * 12, 12, true);
     $active = active_plugin_slugs(true);
     $errors = is_array($GLOBALS['sblog_plugin_errors'] ?? null) ? $GLOBALS['sblog_plugin_errors'] : [];
     $sidebar = render_admin_sidebar('plugins');
@@ -8339,7 +8433,7 @@ function render_admin_plugins_page(): void
                 <p class="panel__meta"><?= h(sblog_t('语言包安装后自动启用，插件设置可在扩展设置中打开。')) ?></p>
               </div>
               <div class="admin-head-actions">
-                <a class="button button--secondary" href="<?= h(url_with_query(url_for('admin_plugins'), ['check_updates' => 1])) ?>"><?= admin_icon('refresh') ?><?= h(sblog_t('检查更新')) ?></a>
+                <a class="button button--secondary" href="<?= h(url_with_query(url_for('admin_plugins'), ['check_updates' => 1, 'p' => $page])) ?>"><?= admin_icon('refresh') ?><?= h(sblog_t('检查更新')) ?></a>
                 <a class="button button--secondary" href="<?= h(url_with_query(url_for('admin_store'), ['type' => 'plugin'])) ?>"><?= admin_icon('store') ?><?= h(sblog_t('获取插件')) ?></a>
               </div>
             </div>
@@ -8351,7 +8445,7 @@ function render_admin_plugins_page(): void
                 <table class="admin-table extension-table">
                   <thead><tr><th scope="col"><?= h(sblog_t('插件')) ?></th><th scope="col"><?= h(sblog_t('状态')) ?></th><th scope="col"><?= h(sblog_t('操作')) ?></th></tr></thead>
                   <tbody>
-                  <?php foreach ($plugins as $slug => $plugin): ?>
+                  <?php foreach ($visiblePlugins as $slug => $plugin): ?>
                     <?php
                     $isActive = in_array($slug, $active, true);
                     $isLanguage = (string)$plugin['locale'] !== '';
@@ -8388,6 +8482,7 @@ function render_admin_plugins_page(): void
                                 <input type="hidden" name="type" value="plugin">
                                 <input type="hidden" name="slug" value="<?= h($slug) ?>">
                                 <input type="hidden" name="return_to" value="plugins">
+                                <input type="hidden" name="return_page" value="<?= $page ?>">
                                 <button class="button" type="submit"><?= h(sblog_t('升级')) ?></button>
                               </form>
                           <?php endif; ?>
@@ -8396,6 +8491,7 @@ function render_admin_plugins_page(): void
                             <?= csrf_field() ?>
                             <input type="hidden" name="plugin" value="<?= h($slug) ?>">
                             <input type="hidden" name="operation" value="<?= $isActive ? 'deactivate' : 'activate' ?>">
+                            <input type="hidden" name="return_page" value="<?= $page ?>">
                             <button class="button <?= $isActive || $updateCompatible ? 'button--secondary' : '' ?>" type="submit"><?= h($isActive ? sblog_t('停用') : sblog_t('启用')) ?></button>
                           </form>
                           <?php endif; ?>
@@ -8406,10 +8502,11 @@ function render_admin_plugins_page(): void
                               <?php if ($isActive && (string)$plugin['settings_action'] !== ''): ?><a href="<?= h(script_url() . '?a=' . rawurlencode((string)$plugin['settings_action'])) ?>"><?= h(sblog_t('设置')) ?></a><?php endif; ?>
                               <?php if ($isLanguage): ?><a href="<?= h(url_with_query(url_for('admin_settings'), ['section' => 'general'])) ?>"><?= h(sblog_t('选择语言')) ?></a><?php endif; ?>
                               <?php if (!$isActive || $isLanguage): ?>
-                            <form method="post" action="<?= h(url_for('uninstall_extension')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定卸载插件 {name} 吗？服务器上的插件文件将被永久删除。', ['name' => (string)$displayMetadata['name']]), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                            <form method="post" action="<?= h(url_for('uninstall_extension')) ?>" data-confirm="<?= h(sblog_t('确定卸载插件 {name} 吗？服务器上的插件文件将被永久删除。', ['name' => (string)$displayMetadata['name']])) ?>">
                               <?= csrf_field() ?>
                               <input type="hidden" name="type" value="plugin">
                               <input type="hidden" name="slug" value="<?= h($slug) ?>">
+                              <input type="hidden" name="return_page" value="<?= $page ?>">
                               <button class="extension-action--danger" type="submit"><?= h(sblog_t('卸载')) ?></button>
                             </form>
                               <?php endif; ?>
@@ -8423,6 +8520,15 @@ function render_admin_plugins_page(): void
                   </tbody>
                 </table>
               </div>
+              <?php if ($totalPages > 1): ?>
+                <div class="admin-table-footer">
+                  <nav class="admin-pagination" aria-label="<?= h(sblog_t('插件分页')) ?>">
+                    <?php if ($page > 1): ?><a class="button button--secondary" rel="prev" href="<?= h(url_with_query(url_for('admin_plugins'), ['p' => $page - 1])) ?>"><?= h(sblog_t('上一页')) ?></a><?php endif; ?>
+                    <span><?= h(sblog_t('第 {page} / {pages} 页', ['page' => $page, 'pages' => $totalPages])) ?></span>
+                    <?php if ($page < $totalPages): ?><a class="button button--secondary" rel="next" href="<?= h(url_with_query(url_for('admin_plugins'), ['p' => $page + 1])) ?>"><?= h(sblog_t('下一页')) ?></a><?php endif; ?>
+                  </nav>
+                </div>
+              <?php endif; ?>
             <?php else: ?>
               <div class="empty-state empty-state--inside"><p><?= h(sblog_t('尚未安装插件。')) ?> <a href="<?= h(url_with_query(url_for('admin_store'), ['type' => 'plugin'])) ?>"><?= h(sblog_t('前往扩展商店')) ?></a></p></div>
             <?php endif; ?>
@@ -8439,6 +8545,10 @@ function render_admin_themes_page(): void
     $themes = available_themes();
     $updateState = extension_updates_for('theme', $themes, (string)($_GET['check_updates'] ?? '') === '1');
     $updates = $updateState['items'];
+    $totalPages = max(1, (int)ceil(count($themes) / 12));
+    $requestedPage = is_scalar($_GET['p'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_GET['p']) === 1 ? (int)$_GET['p'] : 1;
+    $page = max(1, min($totalPages, $requestedPage));
+    $visibleThemes = array_slice($themes, ($page - 1) * 12, 12, true);
     $configuredSlug = trim(setting('active_theme', 'default'));
     $activeSlug = isset($themes[$configuredSlug]) ? $configuredSlug : 'default';
     $sidebar = render_admin_sidebar('themes');
@@ -8455,7 +8565,7 @@ function render_admin_themes_page(): void
                 <p class="panel__meta"><?= h(sblog_tn('{count} 个主题', count($themes))) ?></p>
               </div>
               <div class="admin-head-actions">
-                <a class="button button--secondary" href="<?= h(url_with_query(url_for('admin_themes'), ['check_updates' => 1])) ?>"><?= admin_icon('refresh') ?><?= h(sblog_t('检查更新')) ?></a>
+                <a class="button button--secondary" href="<?= h(url_with_query(url_for('admin_themes'), ['check_updates' => 1, 'p' => $page])) ?>"><?= admin_icon('refresh') ?><?= h(sblog_t('检查更新')) ?></a>
                 <a class="button button--secondary" href="<?= h(url_with_query(url_for('admin_store'), ['type' => 'theme'])) ?>"><?= admin_icon('store') ?><?= h(sblog_t('获取主题')) ?></a>
               </div>
             </div>
@@ -8466,7 +8576,7 @@ function render_admin_themes_page(): void
               <table class="admin-table extension-table theme-table">
                 <thead><tr><th scope="col"><?= h(sblog_t('主题')) ?></th><th scope="col"><?= h(sblog_t('状态')) ?></th><th scope="col"><?= h(sblog_t('操作')) ?></th></tr></thead>
                 <tbody>
-                <?php foreach ($themes as $slug => $theme): ?>
+                <?php foreach ($visibleThemes as $slug => $theme): ?>
                   <?php
                   $isActive = $slug === $activeSlug;
                   $previewUrl = url_with_query(url_for('home'), ['theme_preview' => (string)$slug]);
@@ -8501,18 +8611,21 @@ function render_admin_themes_page(): void
                               <input type="hidden" name="type" value="theme">
                               <input type="hidden" name="slug" value="<?= h($slug) ?>">
                               <input type="hidden" name="return_to" value="themes">
+                              <input type="hidden" name="return_page" value="<?= $page ?>">
                               <button class="button" type="submit"><?= h(sblog_t('升级')) ?></button>
                             </form>
                         <?php endif; ?>
                         <form method="post" action="<?= h(url_for('activate_theme')) ?>" data-theme-activate<?= $isActive ? ' hidden' : '' ?>>
                           <?= csrf_field() ?>
                           <input type="hidden" name="theme" value="<?= h($slug) ?>">
+                          <input type="hidden" name="return_page" value="<?= $page ?>">
                           <button class="button<?= $updateCompatible ? ' button--secondary' : '' ?>" type="submit"><?= h(sblog_t('启用')) ?></button>
                         </form>
                         <?php if ($slug !== 'default'): ?>
                           <form method="post" action="<?= h(url_for('activate_theme')) ?>" data-theme-deactivate<?= $isActive ? '' : ' hidden' ?>>
                             <?= csrf_field() ?>
                             <input type="hidden" name="theme" value="default">
+                            <input type="hidden" name="return_page" value="<?= $page ?>">
                             <button class="button button--secondary" type="submit"><?= h(sblog_t('停用')) ?></button>
                           </form>
                         <?php endif; ?>
@@ -8522,10 +8635,11 @@ function render_admin_themes_page(): void
                             <a href="<?= h($previewUrl) ?>" target="_blank" rel="noopener noreferrer" aria-label="<?= h($previewLabel) ?>"><?= h(sblog_t('打开预览')) ?></a>
                             <?php if (theme_settings_schema((string)$slug)): ?><a href="<?= h(url_with_query(url_for('admin_theme_settings'), ['theme' => (string)$slug])) ?>"><?= h(sblog_t('主题设置')) ?></a><?php endif; ?>
                           <?php if ($slug !== 'default'): ?>
-                          <form method="post" action="<?= h(url_for('uninstall_extension')) ?>" data-theme-uninstall<?= $isActive ? ' hidden' : '' ?> onsubmit="return confirm(<?= h(json_encode(sblog_t('确定卸载主题 {name} 吗？服务器上的主题文件将被永久删除。', ['name' => $themeName]), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+                          <form method="post" action="<?= h(url_for('uninstall_extension')) ?>" data-theme-uninstall<?= $isActive ? ' hidden' : '' ?> data-confirm="<?= h(sblog_t('确定卸载主题 {name} 吗？服务器上的主题文件将被永久删除。', ['name' => $themeName])) ?>">
                             <?= csrf_field() ?>
                             <input type="hidden" name="type" value="theme">
                             <input type="hidden" name="slug" value="<?= h($slug) ?>">
+                            <input type="hidden" name="return_page" value="<?= $page ?>">
                             <button class="extension-action--danger" type="submit"><?= h(sblog_t('卸载')) ?></button>
                           </form>
                         <?php endif; ?>
@@ -8538,6 +8652,15 @@ function render_admin_themes_page(): void
                 </tbody>
               </table>
             </div>
+            <?php if ($totalPages > 1): ?>
+              <div class="admin-table-footer">
+                <nav class="admin-pagination" aria-label="<?= h(sblog_t('主题分页')) ?>">
+                  <?php if ($page > 1): ?><a class="button button--secondary" rel="prev" href="<?= h(url_with_query(url_for('admin_themes'), ['p' => $page - 1])) ?>"><?= h(sblog_t('上一页')) ?></a><?php endif; ?>
+                  <span><?= h(sblog_t('第 {page} / {pages} 页', ['page' => $page, 'pages' => $totalPages])) ?></span>
+                  <?php if ($page < $totalPages): ?><a class="button button--secondary" rel="next" href="<?= h(url_with_query(url_for('admin_themes'), ['p' => $page + 1])) ?>"><?= h(sblog_t('下一页')) ?></a><?php endif; ?>
+                </nav>
+              </div>
+            <?php endif; ?>
           </div>
         </section>
     <?php
@@ -8557,10 +8680,12 @@ function render_admin_theme_settings_page(): void
         return;
     }
     $returnUrl = url_with_query(url_for('admin_theme_settings'), ['theme' => $slug]);
-    $values = theme_settings($slug);
+    $storedValues = theme_settings($slug);
+    $values = $storedValues;
+    $clear = $isPost && is_array($_POST['clear_settings'] ?? null) ? $_POST['clear_settings'] : [];
     $errors = [];
     if ($isPost) {
-        $result = theme_settings_values($slug, is_array($_POST['settings'] ?? null) ? $_POST['settings'] : []);
+        $result = theme_settings_values($slug, is_array($_POST['settings'] ?? null) ? $_POST['settings'] : [], $clear);
         $values = $result['values'];
         $errors = $result['errors'];
         if (!$errors) {
@@ -8594,7 +8719,7 @@ function render_admin_theme_settings_page(): void
                   $hasError = isset($errors[$key]);
                   $describedBy = trim(($hasHint ? $id . '-hint' : '') . ' ' . ($hasError ? $id . '-error' : ''));
                   $attributes = ' id="' . h($id) . '" name="' . h($name) . '"'
-                      . ($field['required'] ? ' required' : '')
+                      . ($field['required'] && !($field['type'] === 'secret' && ($storedValues[$key] ?? '') !== '') ? ' required' : '')
                       . ($describedBy !== '' ? ' aria-describedby="' . h($describedBy) . '"' : '')
                       . ($hasError ? ' aria-invalid="true"' : '');
               ?>
@@ -8607,6 +8732,9 @@ function render_admin_theme_settings_page(): void
                       <textarea<?= $attributes ?> rows="5" maxlength="<?= $field['maxlength'] ?>" placeholder="<?= h($field['placeholder']) ?>"><?= h($value) ?></textarea>
                     <?php elseif ($field['type'] === 'select'): ?>
                       <select<?= $attributes ?>><?php if (!array_key_exists($value, $field['options'])): ?><option value="<?= h($value) ?>" selected disabled><?= h($value) ?></option><?php endif; ?><?php foreach ($field['options'] as $optionValue => $optionLabel): ?><option value="<?= h((string)$optionValue) ?>"<?= (string)$optionValue === $value ? ' selected' : '' ?>><?= h($optionLabel) ?></option><?php endforeach; ?></select>
+                    <?php elseif ($field['type'] === 'secret'): ?>
+                      <input<?= $attributes ?> type="password" value="" maxlength="<?= $field['maxlength'] ?>" autocomplete="new-password" placeholder="<?= h(($storedValues[$key] ?? '') !== '' ? sblog_t('已配置，留空保留') : sblog_t('未设置')) ?>">
+                      <?php if (($storedValues[$key] ?? '') !== ''): ?><label class="setting-option" for="<?= h($id) ?>-clear"><input id="<?= h($id) ?>-clear" type="checkbox" name="clear_settings[<?= h($key) ?>]" value="1"<?= ($clear[$key] ?? null) === '1' ? ' checked' : '' ?>><span><?= h(sblog_t('清除已保存的值')) ?></span></label><?php endif; ?>
                     <?php else: ?>
                       <input<?= $attributes ?> type="<?= $field['type'] === 'date' ? 'date' : 'text' ?>" value="<?= h($value) ?>" maxlength="<?= $field['maxlength'] ?>" placeholder="<?= h($field['placeholder']) ?>"<?= $field['type'] === 'url' ? ' inputmode="url"' : '' ?>>
                     <?php endif; ?>
@@ -8723,7 +8851,7 @@ function render_admin_settings_page(): void
               <div class="field">
                 <label for="site_url"><?= h(sblog_t('站点地址')) ?></label>
                 <input id="site_url" name="site_url" type="url" value="<?= h(setting('site_url')) ?>" placeholder="https://example.com/blog">
-                <p class="field-hint"><?= h(sblog_t('RSS 和找回密码链接会优先使用这里的绝对地址，子目录部署时请带上完整路径。')) ?></p>
+                <p class="field-hint"><?= h(sblog_t('RSS 会优先使用此地址；找回密码和邮件通知需要有效的站点地址。子目录部署请包含完整路径。')) ?></p>
               </div>
               <div class="field"><label for="favicon_url"><?= h(sblog_t('Favicon 地址')) ?></label><input id="favicon_url" name="favicon_url" value="<?= h(setting('favicon_url', 'favicon.png')) ?>" placeholder="favicon.png"><p class="field-hint"><?= h(sblog_t('默认使用项目根目录的 {file}，也可以填写完整图片 URL 或站内绝对路径。', ['file' => 'favicon.png'])) ?></p></div>
               <?php elseif ($section === 'reading'): ?>
@@ -8794,13 +8922,13 @@ location / {
           </div>
           <div class="panel__body">
             <div class="action-row action-row--start">
-              <form method="post" action="<?= h(url_for('clear_cache')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定永久删除所有更新和扩展备份吗？删除后无法从这些备份恢复。'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+              <form method="post" action="<?= h(url_for('clear_cache')) ?>" data-confirm="<?= h(sblog_t('确定永久删除所有更新和扩展备份吗？删除后无法从这些备份恢复。')) ?>">
                 <?= csrf_field() ?>
                 <input type="hidden" name="settings_section" value="maintenance">
                 <input type="hidden" name="kind" value="backups">
                 <button class="button button--danger" type="submit"<?= $backupCount === 0 ? ' disabled' : '' ?>><?= h(sblog_t('清理备份（{count} 项）', ['count' => $backupCount])) ?></button>
               </form>
-              <form method="post" action="<?= h(url_for('clear_cache')) ?>" onsubmit="return confirm(<?= h(json_encode(sblog_t('确定删除可重建的缓存文件吗？'), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) ?>);">
+              <form method="post" action="<?= h(url_for('clear_cache')) ?>" data-confirm="<?= h(sblog_t('确定删除可重建的缓存文件吗？')) ?>">
                 <?= csrf_field() ?>
                 <input type="hidden" name="settings_section" value="maintenance">
                 <input type="hidden" name="kind" value="cache">
@@ -9398,11 +9526,13 @@ switch ($action) {
 
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             verify_csrf();
-            $rate = password_reset_rate_state();
-            if ((int)$rate['count'] >= 3) {
+            if (configured_site_root_url() === '') {
+                render_forgot_password_page('', sblog_t('站点尚未配置有效的站点地址，暂时无法找回密码。请联系管理员。'));
+            }
+            $rate = password_reset_rate_state(true);
+            if (!$rate['allowed']) {
                 render_forgot_password_page('', sblog_t('重置请求过于频繁，请 15 分钟后再试。'));
             }
-            password_reset_rate_state(true);
 
             $account = trim((string)($_POST['account'] ?? ''));
             if ($account === '') {
@@ -9466,8 +9596,8 @@ switch ($action) {
 
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             verify_csrf();
-            $rate = login_rate_state();
-            if ((int)$rate['count'] >= 5) {
+            $rate = login_rate_state(true);
+            if (!$rate['allowed']) {
                 render_login_page(sblog_t('登录尝试过多，请 15 分钟后再试。'));
             }
             $username = trim((string)($_POST['username'] ?? ''));
@@ -9475,7 +9605,6 @@ switch ($action) {
             $user = one('SELECT * FROM users WHERE username = ?', [$username]);
 
             if (!$user || !password_verify($password, (string)$user['password_hash'])) {
-                login_rate_state(true);
                 render_login_page(sblog_t('用户名或密码不正确。'), ['username' => $username]);
             }
 
@@ -9503,6 +9632,7 @@ switch ($action) {
 
     case 'install_update':
         require_admin_post(url_for('admin'));
+        $acceptsJson = str_contains(strtolower((string)($_SERVER['HTTP_ACCEPT'] ?? '')), 'application/json');
         try {
             $expectedVersion = trim((string)($_POST['expected_version'] ?? ''));
             $expectedSchemaKnown = (string)($_POST['expected_database_schema_known'] ?? '') === '1';
@@ -9525,15 +9655,21 @@ switch ($action) {
             }
             $version = install_github_update($update);
             if (!empty($update['requires_database_upgrade'])) {
-                set_flash('warning', sblog_t('已更新到 {version}，数据库升级尚未完成，请继续执行数据库升级。', ['version' => $version]), 'database_upgrade');
+                $message = sblog_t('已更新到 {version}，数据库升级尚未完成，请继续执行数据库升级。', ['version' => $version]);
+                set_flash('warning', $message, 'database_upgrade');
             } elseif (!$freshSchemaKnown) {
-                set_flash('warning', sblog_t('已更新到 {version}，但发布信息未声明数据库版本，请检查是否需要执行数据库升级。', ['version' => $version]), 'database_upgrade');
+                $message = sblog_t('已更新到 {version}，但发布信息未声明数据库版本，请检查是否需要执行数据库升级。', ['version' => $version]);
+                set_flash('warning', $message, 'database_upgrade');
             } else {
-                set_flash('success', sblog_t('已更新到 {version}。', ['version' => $version]));
+                $message = sblog_t('已更新到 {version}。', ['version' => $version]);
+                set_flash('success', $message);
             }
         } catch (Throwable $exception) {
-            set_flash('error', sblog_t('更新失败：{error}', ['error' => $exception->getMessage()]));
+            $message = sblog_t('更新失败：{error}', ['error' => $exception->getMessage()]);
+            if ($acceptsJson) { json_response(['ok' => false, 'error' => $message], 422); }
+            set_flash('error', $message);
         }
+        if ($acceptsJson) { json_response(['ok' => true, 'redirect_url' => url_for('admin'), 'message' => $message]); }
         redirect_to(url_for('admin'));
         break;
 
@@ -9566,16 +9702,19 @@ switch ($action) {
         break;
     case 'install_extension':
         require_admin_post(url_for('admin_store'));
-        $type = strtolower(trim((string)($_POST['type'] ?? '')));
-        $slug = strtolower(trim((string)($_POST['slug'] ?? '')));
-        $returnType = strtolower(trim((string)($_POST['return_type'] ?? 'all')));
-        $returnTo = strtolower(trim((string)($_POST['return_to'] ?? 'store')));
+        $type = is_string($_POST['type'] ?? null) ? strtolower(trim($_POST['type'])) : '';
+        $slug = is_string($_POST['slug'] ?? null) ? strtolower(trim($_POST['slug'])) : '';
+        $returnType = is_string($_POST['return_type'] ?? null) ? strtolower(trim($_POST['return_type'])) : 'all';
+        $returnTo = is_string($_POST['return_to'] ?? null) ? strtolower(trim($_POST['return_to'])) : 'store';
         if (!in_array($returnType, ['all', 'theme', 'plugin'], true)) {
             $returnType = 'all';
         }
         if (!in_array($returnTo, ['store', 'themes', 'plugins'], true)) {
             $returnTo = 'store';
         }
+        $returnSearch = extension_store_search_query($_POST['return_q'] ?? null);
+        $returnPage = is_string($_POST['return_page'] ?? null) && preg_match('/^[0-9]+$/D', $_POST['return_page']) === 1
+            ? max(1, (int)$_POST['return_page']) : 1;
         try {
             $catalog = extension_store_catalog();
             $extension = $catalog['extensions'][$type . ':' . $slug] ?? null;
@@ -9595,9 +9734,9 @@ switch ($action) {
             set_flash('error', sblog_t('扩展安装失败：{error}', ['error' => $exception->getMessage()]));
         }
         $returnUrl = match ($returnTo) {
-            'themes' => url_for('admin_themes'),
-            'plugins' => url_for('admin_plugins'),
-            default => url_with_query(url_for('admin_store'), ['type' => $returnType]),
+            'themes' => url_with_query(url_for('admin_themes'), ['p' => $returnPage]),
+            'plugins' => url_with_query(url_for('admin_plugins'), ['p' => $returnPage]),
+            default => url_with_query(url_for('admin_store'), ['type' => $returnType, 'q' => $returnSearch, 'p' => $returnPage]),
         };
         redirect_to($returnUrl, 303);
         break;
@@ -9606,7 +9745,8 @@ switch ($action) {
         require_admin_post(url_for('admin_plugins'));
         $type = trim((string)($_POST['type'] ?? ''));
         $slug = trim((string)($_POST['slug'] ?? ''));
-        $returnUrl = $type === 'theme' ? url_for('admin_themes') : url_for('admin_plugins');
+        $returnPage = is_scalar($_POST['return_page'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_POST['return_page']) === 1 ? max(1, (int)$_POST['return_page']) : 1;
+        $returnUrl = url_with_query($type === 'theme' ? url_for('admin_themes') : url_for('admin_plugins'), ['p' => $returnPage]);
         try {
             uninstall_extension($type, $slug);
             set_flash('success', $type === 'theme'
@@ -9632,16 +9772,18 @@ switch ($action) {
 
     case 'toggle_plugin':
         require_admin_post(url_for('admin_plugins'));
+        $returnPage = is_scalar($_POST['return_page'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_POST['return_page']) === 1 ? max(1, (int)$_POST['return_page']) : 1;
+        $returnUrl = url_with_query(url_for('admin_plugins'), ['p' => $returnPage]);
         $slug = trim((string)($_POST['plugin'] ?? ''));
         $operation = (string)($_POST['operation'] ?? '');
         $plugins = available_plugins();
         if (!isset($plugins[$slug]) || !in_array($operation, ['activate', 'deactivate'], true)) {
             set_flash('error', sblog_t('插件不存在或操作无效。'));
-            redirect_to(url_for('admin_plugins'));
+            redirect_to($returnUrl);
         }
         if ((string)$plugins[$slug]['locale'] !== '') {
             set_flash('error', sblog_t('语言包安装后自动启用，请在常规设置中选择站点语言。'));
-            redirect_to(url_for('admin_plugins'), 303);
+            redirect_to($returnUrl, 303);
         }
         $activePlugins = active_plugin_slugs(true);
         if ($operation === 'activate' && !in_array($slug, $activePlugins, true)) {
@@ -9656,7 +9798,7 @@ switch ($action) {
         save_active_plugins($activePlugins);
         plugin_action('plugin_status_changed', ['plugin' => $slug, 'operation' => $operation]);
         set_flash('success', $operation === 'activate' ? sblog_t('插件已启用。') : sblog_t('插件已停用。'));
-        redirect_to(url_with_query(url_for('admin_plugins'), ['changed' => bin2hex(random_bytes(4))]), 303);
+        redirect_to(url_with_query($returnUrl, ['changed' => bin2hex(random_bytes(4))]), 303);
         break;
 
     case 'save_media':
@@ -9702,6 +9844,8 @@ switch ($action) {
 
     case 'activate_theme':
         require_admin_post(url_for('admin_themes'));
+        $returnPage = is_scalar($_POST['return_page'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_POST['return_page']) === 1 ? max(1, (int)$_POST['return_page']) : 1;
+        $returnUrl = url_with_query(url_for('admin_themes'), ['p' => $returnPage]);
         $themeSlug = trim((string)($_POST['theme'] ?? ''));
         $acceptsJson = str_contains(strtolower((string)($_SERVER['HTTP_ACCEPT'] ?? '')), 'application/json');
         if (!array_key_exists($themeSlug, available_themes())) {
@@ -9709,14 +9853,14 @@ switch ($action) {
                 json_response(['ok' => false, 'error' => sblog_t('所选主题不存在或 theme.json 无效。')], 422);
             }
             set_flash('error', sblog_t('所选主题不存在或 theme.json 无效。'));
-            redirect_to(url_for('admin_themes'));
+            redirect_to($returnUrl);
         }
         save_settings(['active_theme' => $themeSlug]);
         if ($acceptsJson) {
             json_response(['ok' => true, 'active_theme' => $themeSlug]);
         }
         set_flash('success', $themeSlug === 'default' ? sblog_t('已停用当前主题并恢复默认主题。') : sblog_t('主题已启用。'));
-        redirect_to(url_with_query(url_for('admin_themes'), ['changed' => bin2hex(random_bytes(4))]), 303);
+        redirect_to(url_with_query($returnUrl, ['changed' => bin2hex(random_bytes(4))]), 303);
         break;
 
     case 'save_settings':
@@ -10028,6 +10172,7 @@ switch ($action) {
 
     case 'change_status':
         require_admin_post(url_for('admin_posts'));
+        $returnPage = is_scalar($_POST['return_page'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_POST['return_page']) === 1 ? max(1, (int)$_POST['return_page']) : 1;
         $id = (int)($_POST['id'] ?? 0);
         $status = (string)($_POST['status'] ?? 'draft');
         $post = fetch_post_by_id($id);
@@ -10041,15 +10186,16 @@ switch ($action) {
         }
         q('UPDATE posts SET status = ?, published_at = ?, updated_at = ? WHERE id = ?', [$target, $publishedAt, time(), $id]);
         set_flash('success', $target === 'published' ? sblog_t('文章已发布。') : sblog_t('文章已转为草稿。'));
-        redirect_to(url_for('admin_posts'));
+        redirect_to(url_with_query(url_for('admin_posts'), ['p' => $returnPage]));
         break;
 
     case 'delete_post':
         require_admin_post(url_for('admin_posts'));
+        $returnPage = is_scalar($_POST['return_page'] ?? null) && preg_match('/^[0-9]+$/D', (string)$_POST['return_page']) === 1 ? max(1, (int)$_POST['return_page']) : 1;
         $id = (int)($_POST['id'] ?? 0);
         q('DELETE FROM posts WHERE id = ?', [$id]);
         set_flash('success', sblog_t('文章已删除。'));
-        redirect_to(url_for('admin_posts'));
+        redirect_to(url_with_query(url_for('admin_posts'), ['p' => $returnPage]));
         break;
 
     default:
