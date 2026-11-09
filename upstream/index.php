@@ -23,7 +23,7 @@ session_set_cookie_params([
 ]);
 session_start();
 
-const APP_VERSION = 'v1.14.29';
+const APP_VERSION = 'v1.14.30';
 const DATABASE_SCHEMA_VERSION = 1;
 const DATABASE_MAINTENANCE_VERSION = 1;
 const DATA_DIR = __DIR__ . '/data';
@@ -37,6 +37,7 @@ const INSTALL_LOCK_FILE = DATA_DIR . '/install.lock';
 const SETTINGS_CACHE_FILE = CACHE_DIR . '/settings.php';
 const UPDATE_REPOSITORY = 'jkjoy/Simple-PHP-Blog';
 const UPDATE_CACHE_FILE = CACHE_DIR . '/github-update.json';
+const UPDATE_CHECK_INTERVAL = 86400;
 const EXTENSION_STORE_URL = 'https://raw.githubusercontent.com/jkjoy/SBlog-Extensions/catalog/catalog.json';
 const EXTENSION_STORE_FALLBACK_URL = 'https://cdn.jsdelivr.net/gh/jkjoy/SBlog-Extensions@catalog/catalog.json';
 const EXTENSION_STORE_CACHE_FILE = CACHE_DIR . '/extension-store.json';
@@ -599,6 +600,7 @@ function default_settings(): array
         'active_theme' => 'default',
         'active_plugins' => '[]',
         'site_language' => 'zh-CN',
+        'site_timezone' => 'Asia/Shanghai',
         'favicon_url' => 'favicon.png',
         'footer_beian' => '',
         'posts_per_page' => '6',
@@ -644,6 +646,13 @@ function setting(string $key, string $default = ''): string
 {
     $settings = settings_cache();
     return (string)($settings[$key] ?? $default);
+}
+
+function site_timezone(): string
+{
+    $default = default_settings()['site_timezone'];
+    $timezone = setting('site_timezone', $default);
+    return in_array($timezone, timezone_identifiers_list(), true) ? $timezone : $default;
 }
 
 function save_settings(array $values): void
@@ -1319,53 +1328,80 @@ function update_info_with_database_requirement(array $info): array
     return $info;
 }
 
+function cached_github_update_info(): ?array
+{
+    clearstatcache(true, UPDATE_CACHE_FILE);
+    if (!is_file(UPDATE_CACHE_FILE)) { return null; }
+    $age = time() - (int)filemtime(UPDATE_CACHE_FILE);
+    if ($age < 0 || $age >= UPDATE_CHECK_INTERVAL) { return null; }
+    $cached = json_decode((string)file_get_contents(UPDATE_CACHE_FILE), true);
+    if (!is_array($cached) || !array_key_exists('database_schema', $cached) || !array_key_exists('database_schema_known', $cached)
+        || !is_string($cached['latest'] ?? null) || !is_string($cached['download_url'] ?? null)
+        || !is_string($cached['release_notes'] ?? null) || !is_string($cached['release_url'] ?? null)
+        || !is_string($cached['error'] ?? null)) {
+        return null;
+    }
+    $cached['current'] = APP_VERSION;
+    $cached['available'] = update_available_for($cached['latest']);
+    return update_info_with_database_requirement($cached);
+}
+
 function github_update_info(bool $refresh = false): array
 {
     ensure_runtime_dirs();
-    if (!$refresh && is_file(UPDATE_CACHE_FILE) && time() - (int)filemtime(UPDATE_CACHE_FILE) < 21600) {
-        $cached = json_decode((string)file_get_contents(UPDATE_CACHE_FILE), true);
-        if (is_array($cached) && array_key_exists('database_schema', $cached) && array_key_exists('database_schema_known', $cached)) {
-            $cached['current'] = APP_VERSION;
-            $cached['available'] = update_available_for((string)($cached['latest'] ?? ''));
-            return update_info_with_database_requirement($cached);
-        }
+    if (!$refresh && ($cached = cached_github_update_info()) !== null) { return $cached; }
+    $lock = fopen(CACHE_DIR . '/github-update.lock', 'c');
+    if ($lock === false || !flock($lock, LOCK_EX)) {
+        if (is_resource($lock)) { fclose($lock); }
+        throw new RuntimeException(sblog_t('无法锁定更新检查，请稍后重试。'));
     }
-    $result = ['available' => false, 'current' => APP_VERSION, 'latest' => '', 'download_url' => '', 'database_schema' => null, 'database_schema_known' => false, 'database_schema_incompatible' => false, 'requires_database_upgrade' => false, 'error' => ''];
-    if (!function_exists('curl_init')) {
-        $result['error'] = sblog_t('服务器未启用 cURL，无法检查更新。');
+    try {
+        if (!$refresh && ($cached = cached_github_update_info()) !== null) { return $cached; }
+        $result = ['available' => false, 'current' => APP_VERSION, 'latest' => '', 'download_url' => '', 'release_notes' => '', 'release_url' => '', 'database_schema' => null, 'database_schema_known' => false, 'database_schema_incompatible' => false, 'requires_database_upgrade' => false, 'error' => ''];
+        if (!function_exists('curl_init')) {
+            $result['error'] = sblog_t('服务器未启用 cURL，无法检查更新。');
+        } else {
+            $curl = curl_init('https://api.github.com/repos/' . UPDATE_REPOSITORY . '/releases/latest');
+            curl_setopt_array($curl, array_replace([
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_CONNECTTIMEOUT => 10,
+                CURLOPT_TIMEOUT => 20,
+                CURLOPT_USERAGENT => 'Simple-PHP-Blog/' . APP_VERSION,
+                CURLOPT_HTTPHEADER => ['Accept: application/vnd.github+json'],
+            ], curl_trust_options()));
+            $body = curl_exec($curl);
+            $status = (int)curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+            $curlError = curl_error($curl);
+            curl_close($curl);
+            $release = is_string($body) ? json_decode($body, true) : null;
+            if ($status !== 200 || !is_array($release)) {
+                $result['error'] = $curlError !== '' ? $curlError : sblog_t('GitHub 暂时无法访问。');
+            } else {
+                $latest = is_string($release['tag_name'] ?? null) ? trim($release['tag_name']) : '';
+                $download = is_string($release['zipball_url'] ?? null) ? $release['zipball_url'] : '';
+                if ($latest === '' || !filter_var($download, FILTER_VALIDATE_URL)) {
+                    $result['error'] = sblog_t('GitHub 发布信息无效。');
+                } else {
+                    $releaseBody = is_string($release['body'] ?? null) ? $release['body'] : '';
+                    $result['latest'] = $latest;
+                    $result['download_url'] = $download;
+                    $result['release_notes'] = trim(preg_replace('/<!--\s*sblog-release-meta\b.*?-->/s', '', $releaseBody) ?? $releaseBody);
+                    $result['release_url'] = 'https://github.com/' . UPDATE_REPOSITORY . '/releases/tag/' . rawurlencode($latest);
+                    $releaseSchema = release_database_schema($releaseBody);
+                    $result['database_schema'] = $releaseSchema;
+                    $result['database_schema_known'] = $releaseSchema !== null;
+                    $result['available'] = update_available_for($latest);
+                }
+            }
+        }
+        $result = update_info_with_database_requirement($result);
+        file_put_contents(UPDATE_CACHE_FILE, json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
         return $result;
+    } finally {
+        flock($lock, LOCK_UN);
+        fclose($lock);
     }
-    $curl = curl_init('https://api.github.com/repos/' . UPDATE_REPOSITORY . '/releases/latest');
-    curl_setopt_array($curl, array_replace([
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_CONNECTTIMEOUT => 10,
-        CURLOPT_TIMEOUT => 20,
-        CURLOPT_USERAGENT => 'Simple-PHP-Blog/' . APP_VERSION,
-        CURLOPT_HTTPHEADER => ['Accept: application/vnd.github+json'],
-    ], curl_trust_options()));
-    $body = curl_exec($curl);
-    $status = (int)curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-    $curlError = curl_error($curl);
-    curl_close($curl);
-    $release = is_string($body) ? json_decode($body, true) : null;
-    if ($status !== 200 || !is_array($release)) {
-        $result['error'] = $curlError !== '' ? $curlError : sblog_t('GitHub 暂时无法访问。');
-    } else {
-        $latest = trim((string)($release['tag_name'] ?? ''));
-        $download = (string)($release['zipball_url'] ?? '');
-        if ($latest !== '' && filter_var($download, FILTER_VALIDATE_URL)) {
-            $result['latest'] = $latest;
-            $result['download_url'] = $download;
-            $releaseSchema = release_database_schema((string)($release['body'] ?? ''));
-            $result['database_schema'] = $releaseSchema;
-            $result['database_schema_known'] = $releaseSchema !== null;
-            $result['available'] = update_available_for($latest);
-        }
-    }
-    $result = update_info_with_database_requirement($result);
-    file_put_contents(UPDATE_CACHE_FILE, json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
-    return $result;
 }
 
 function install_release_files(string $source, string $targetRoot, string $backup): void
@@ -1868,8 +1904,7 @@ function managed_cache_targets(string $kind): array
                 || preg_match('/^extension-backup-(?:theme|plugin)-[a-z0-9][a-z0-9_-]*-\d{8}-\d{6}-[a-f0-9]{4}$/D', $entry);
             if (!$matched || !is_dir($path)) { continue; }
         } else {
-            $matched = in_array($entry, ['github-update.json', 'extension-store.json'], true)
-                || preg_match('/^media-douban-(?:cover-)?[a-z0-9_-]+\.(?:json|jpg)$/D', $entry);
+            $matched = in_array($entry, ['github-update.json', 'extension-store.json'], true);
             if (!$matched || !is_file($path)) { continue; }
         }
         $resolved = realpath($path);
@@ -3923,333 +3958,6 @@ function media_iframe_html(string $provider, string $src, string $kind = 'video'
         . '" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"' . $allow . '></iframe></figure>';
 }
 
-function media_text_value(mixed $value, int $limit = 180): string
-{
-    if (!is_scalar($value)) {
-        return '';
-    }
-
-    $text = trim((string)preg_replace('/\s+/u', ' ', (string)$value));
-    return $text === '' ? '' : str_sub_u($text, 0, $limit);
-}
-
-function media_name_list(mixed $value, int $limit = 5): array
-{
-    if (!is_array($value)) {
-        return [];
-    }
-
-    $names = [];
-    foreach ($value as $item) {
-        $name = is_array($item) ? media_text_value($item['name'] ?? '') : media_text_value($item);
-        if ($name !== '' && !in_array($name, $names, true)) {
-            $names[] = $name;
-        }
-        if (count($names) >= $limit) {
-            break;
-        }
-    }
-    return $names;
-}
-
-function douban_subject_type(string $host, string $path): string
-{
-    foreach (['movie', 'book', 'music'] as $type) {
-        if (media_host_matches($host, $type . '.douban.com')
-            || preg_match('#/' . $type . '/subject/#i', $path)) {
-            return $type;
-        }
-    }
-    return '';
-}
-
-function douban_normalize_subject(array $subject, string $type): array
-{
-    $title = media_text_value($subject['title'] ?? '', 120);
-    if ($title === '') {
-        return [];
-    }
-
-    $subtitle = $type === 'movie'
-        ? media_text_value($subject['original_title'] ?? '', 120)
-        : media_text_value($subject['subtitle'] ?? '', 120);
-    if ($subtitle === $title) {
-        $subtitle = '';
-    }
-
-    $pubdates = media_name_list($subject['pubdate'] ?? [], 1);
-    $year = media_text_value($subject['year'] ?? '', 12);
-    if ($year === '' && $pubdates !== [] && preg_match('/(?:19|20)\d{2}/', $pubdates[0], $match)) {
-        $year = $match[0];
-    }
-
-    $genres = media_name_list($subject['genres'] ?? [], 4);
-    $credits = [];
-    if ($type === 'movie') {
-        $directors = media_name_list($subject['directors'] ?? [], 3);
-        $actors = media_name_list($subject['actors'] ?? [], 5);
-        if ($directors !== []) { $credits[] = ['label' => '导演', 'value' => implode(' / ', $directors)]; }
-        if ($actors !== []) { $credits[] = ['label' => '主演', 'value' => implode(' / ', $actors)]; }
-    } elseif ($type === 'book') {
-        $authors = media_name_list($subject['author'] ?? [], 4);
-        $publishers = media_name_list($subject['press'] ?? [], 2);
-        if ($authors !== []) { $credits[] = ['label' => '作者', 'value' => implode(' / ', $authors)]; }
-        if ($publishers !== []) { $credits[] = ['label' => '出版', 'value' => implode(' / ', $publishers)]; }
-    } elseif ($type === 'music') {
-        $artists = media_name_list($subject['singer'] ?? [], 4);
-        $publishers = media_name_list($subject['publisher'] ?? [], 2);
-        if ($artists !== []) { $credits[] = ['label' => '表演者', 'value' => implode(' / ', $artists)]; }
-        if ($publishers !== []) { $credits[] = ['label' => '发行', 'value' => implode(' / ', $publishers)]; }
-    }
-
-    $rating = (float)($subject['rating']['value'] ?? 0);
-    $ratingCount = max(0, (int)($subject['rating']['count'] ?? 0));
-    $cover = media_text_value($subject['cover_url'] ?? '', 500);
-    $coverParts = $cover !== '' ? parse_url($cover) : false;
-    $coverHost = is_array($coverParts) ? str_lower_u((string)($coverParts['host'] ?? '')) : '';
-    if (!is_array($coverParts) || (string)($coverParts['scheme'] ?? '') !== 'https' || !media_host_matches($coverHost, 'doubanio.com')) {
-        $cover = '';
-    }
-
-    return [
-        'type' => $type,
-        'title' => $title,
-        'subtitle' => $subtitle,
-        'cover' => $cover,
-        'meta' => array_values(array_filter(array_merge([$year], $genres), static fn(string $item): bool => $item !== '')),
-        'credits' => array_slice($credits, 0, 2),
-        'rating' => $rating > 0 ? number_format($rating, 1, '.', '') : '',
-        'rating_count' => $ratingCount,
-    ];
-}
-
-function douban_subject_cache_file(string $type, string $id): string
-{
-    return CACHE_DIR . '/media-douban-' . $type . '-' . $id . '.json';
-}
-
-function douban_subject_cached(string $type, string $id): array
-{
-    $cacheFile = douban_subject_cache_file($type, $id);
-    $cached = is_file($cacheFile) ? json_decode((string)file_get_contents($cacheFile), true) : null;
-    return [
-        'data' => is_array($cached['data'] ?? null) ? $cached['data'] : [],
-        'fetched_at' => (int)($cached['fetched_at'] ?? 0),
-    ];
-}
-
-function douban_subject_data(string $type, string $id): array
-{
-    static $memory = [];
-    $key = $type . ':' . $id;
-    if (isset($memory[$key])) {
-        return $memory[$key];
-    }
-
-    ensure_runtime_dirs();
-    $cacheFile = douban_subject_cache_file($type, $id);
-    ['data' => $cachedData, 'fetched_at' => $cachedAt] = douban_subject_cached($type, $id);
-    $ttl = $cachedData !== [] ? 604800 : 3600;
-    if ($cachedAt > 0 && time() - $cachedAt < $ttl) {
-        return $memory[$key] = $cachedData;
-    }
-
-    $normalized = [];
-    if (function_exists('curl_init')) {
-        $endpoint = 'https://m.douban.com/rexxar/api/v2/' . $type . '/' . $id . '?ck=&for_mobile=1';
-        $curl = curl_init($endpoint);
-        curl_setopt_array($curl, array_replace([
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_CONNECTTIMEOUT => 2,
-            CURLOPT_TIMEOUT => 5,
-            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-            CURLOPT_ENCODING => '',
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; SimplePHPBlog/' . APP_VERSION . ')',
-            CURLOPT_HTTPHEADER => [
-                'Accept: application/json',
-                'Accept-Language: zh-CN,zh;q=0.9',
-                'Referer: https://m.douban.com/' . $type . '/subject/' . $id . '/',
-            ],
-        ], curl_trust_options()));
-        $body = curl_exec($curl);
-        $status = (int)curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-        curl_close($curl);
-        if ($status === 200 && is_string($body) && strlen($body) <= 1048576) {
-            $subject = json_decode($body, true);
-            if (is_array($subject)) {
-                $normalized = douban_normalize_subject($subject, $type);
-            }
-        }
-    }
-
-    if ($normalized !== []) {
-        @file_put_contents($cacheFile, json_encode([
-            'fetched_at' => time(),
-            'data' => $normalized,
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
-        return $memory[$key] = $normalized;
-    }
-
-    if ($cachedData === []) {
-        @file_put_contents($cacheFile, json_encode([
-            'fetched_at' => time(),
-            'data' => [],
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
-    }
-    return $memory[$key] = $cachedData;
-}
-
-function render_douban_cover(): never
-{
-    $type = trim((string)($_GET['type'] ?? ''));
-    $id = trim((string)($_GET['id'] ?? ''));
-    if (!in_array($type, ['movie', 'book', 'music'], true) || !preg_match('/^\d{1,12}$/', $id)) {
-        http_response_code(404);
-        exit;
-    }
-
-    ensure_runtime_dirs();
-    $cacheFile = CACHE_DIR . '/media-douban-cover-' . $type . '-' . $id . '.jpg';
-    $sendFile = static function (string $file): never {
-        header('Content-Type: image/jpeg');
-        header('Content-Length: ' . (string)filesize($file));
-        header('Cache-Control: public, max-age=86400, stale-if-error=604800');
-        header('X-Content-Type-Options: nosniff');
-        header('Cross-Origin-Resource-Policy: same-origin');
-        readfile($file);
-        exit;
-    };
-
-    if (is_file($cacheFile) && time() - (int)filemtime($cacheFile) < 604800) {
-        $sendFile($cacheFile);
-    }
-
-    // Only proxy covers for subjects that article rendering has already cached. The subject
-    // data is read without refreshing, so this public endpoint never fetches subject details.
-    $subject = douban_subject_cached($type, $id)['data'];
-    if ($subject === []) {
-        if (is_file($cacheFile)) {
-            $sendFile($cacheFile);
-        }
-        header('Cache-Control: no-store');
-        http_response_code(404);
-        exit;
-    }
-    $coverUrl = (string)($subject['cover'] ?? '');
-    $image = '';
-    $contentType = '';
-    if ($coverUrl !== '' && function_exists('curl_init')) {
-        $curl = curl_init($coverUrl);
-        curl_setopt_array($curl, array_replace([
-            CURLOPT_FOLLOWLOCATION => false,
-            CURLOPT_CONNECTTIMEOUT => 2,
-            CURLOPT_TIMEOUT => 5,
-            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
-            CURLOPT_USERAGENT => 'Mozilla/5.0 (compatible; SimplePHPBlog/' . APP_VERSION . ')',
-            CURLOPT_HTTPHEADER => [
-                'Accept: image/jpeg',
-                'Referer: https://m.douban.com/' . $type . '/subject/' . $id . '/',
-            ],
-            CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$image): int {
-                if (strlen($image) + strlen($chunk) > 2097152) {
-                    return 0;
-                }
-                $image .= $chunk;
-                return strlen($chunk);
-            },
-        ], curl_trust_options()));
-        curl_exec($curl);
-        $status = (int)curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-        $contentType = str_lower_u(trim(explode(';', (string)curl_getinfo($curl, CURLINFO_CONTENT_TYPE))[0]));
-        curl_close($curl);
-
-        if ($status !== 200 || $contentType !== 'image/jpeg' || strlen($image) < 128) {
-            $image = '';
-        }
-    }
-
-    if ($image !== '') {
-        @file_put_contents($cacheFile, $image, LOCK_EX);
-        if (is_file($cacheFile)) {
-            $sendFile($cacheFile);
-        }
-        header('Content-Type: image/jpeg');
-        header('Content-Length: ' . (string)strlen($image));
-        header('Cache-Control: public, max-age=86400');
-        header('X-Content-Type-Options: nosniff');
-        echo $image;
-        exit;
-    }
-
-    if (is_file($cacheFile)) {
-        $sendFile($cacheFile);
-    }
-
-    header('Cache-Control: no-store');
-    http_response_code(404);
-    exit;
-}
-
-function douban_media_card_html(string $url, string $host, string $type, string $id): string
-{
-    $subject = $type !== '' ? douban_subject_data($type, $id) : [];
-    $detailed = $subject !== [];
-    $label = match ($type) {
-        'movie' => sblog_t('豆瓣电影'),
-        'book' => sblog_t('豆瓣读书'),
-        'music' => sblog_t('豆瓣音乐'),
-        default => sblog_t('豆瓣资料'),
-    };
-    $title = $detailed ? (string)$subject['title'] : sblog_t('豆瓣媒体资料');
-    $class = 'media-link-card media-link-card--douban' . ($detailed ? ' media-link-card--detailed media-link-card--' . h($type) : '');
-    $cover = '<span class="media-link-card__cover" aria-hidden="true"><span class="media-link-card__cover-fallback">豆</span>';
-    if ($detailed && (string)$subject['cover'] !== '') {
-        $coverUrl = script_url() . '?a=douban_cover&type=' . rawurlencode($type) . '&id=' . rawurlencode($id);
-        $cover .= '<img src="' . h($coverUrl) . '" alt="" loading="lazy" decoding="async" onerror="this.remove()">';
-    }
-    $cover .= '</span>';
-
-    $subtitle = $detailed && (string)$subject['subtitle'] !== ''
-        ? '<small class="media-link-card__subtitle">' . h($subject['subtitle']) . '</small>'
-        : '';
-    $facts = '';
-    foreach (($detailed ? $subject['meta'] : [$host]) as $fact) {
-        $facts .= '<span>' . h($fact) . '</span>';
-    }
-    $credits = '';
-    $creditLabels = [
-        '导演' => sblog_t('导演'),
-        '主演' => sblog_t('主演'),
-        '作者' => sblog_t('作者'),
-        '出版' => sblog_t('出版'),
-        '表演者' => sblog_t('表演者'),
-        '发行' => sblog_t('发行'),
-    ];
-    foreach (($detailed ? $subject['credits'] : []) as $credit) {
-        $sourceLabel = (string)$credit['label'];
-        $credits .= '<span><b>' . h($creditLabels[$sourceLabel] ?? $sourceLabel) . '</b><span>' . h($credit['value']) . '</span></span>';
-    }
-    $rating = '';
-    if ($detailed && (string)$subject['rating'] !== '') {
-        $ratingCount = (int)$subject['rating_count'];
-        $ratingLabel = $ratingCount > 0
-            ? sblog_tn('豆瓣评分 {rating} 分，{count} 人评价', $ratingCount, ['rating' => (string)$subject['rating']])
-            : sblog_t('豆瓣评分 {rating} 分', ['rating' => (string)$subject['rating']]);
-        $rating = '<span class="media-link-card__rating" aria-label="' . h($ratingLabel) . '"><b>'
-            . h($subject['rating']) . '</b><small>' . h(sblog_t('豆瓣评分')) . '</small></span>';
-    }
-
-    return '<aside class="' . $class . '">' . $cover
-        . '<span class="media-link-card__body"><small class="media-link-card__eyebrow">' . h($label) . '</small>'
-        . '<strong class="media-link-card__title">' . h($title) . '</strong>' . $subtitle
-        . '<span class="media-link-card__facts">' . $facts . '</span>'
-        . ($credits !== '' ? '<span class="media-link-card__credits">' . $credits . '</span>' : '') . '</span>'
-        . '<span class="media-link-card__side">' . $rating
-        . '<a class="media-link-card__action" href="' . h($url) . '" target="_blank" rel="noopener noreferrer">' . h(sblog_t('查看详情')) . '<span aria-hidden="true"> →</span></a>'
-        . '</span></aside>';
-}
-
 function media_embed_html(string $url): string
 {
     if (!filter_var($url, FILTER_VALIDATE_URL)) {
@@ -4263,6 +3971,11 @@ function media_embed_html(string $url): string
     $path = (string)($parts['path'] ?? '');
     if (!in_array($scheme, ['http', 'https'], true) || $host === '') {
         return '';
+    }
+
+    $customEmbed = plugin_filter('media_embed_html', null, ['url' => $url]);
+    if (is_string($customEmbed)) {
+        return $customEmbed;
     }
 
     $query = [];
@@ -4319,10 +4032,6 @@ function media_embed_html(string $url): string
                 'https://www.youtube-nocookie.com/embed/' . rawurlencode($videoId)
             );
         }
-    }
-
-    if (media_host_matches($host, 'douban.com') && preg_match('#/subject/(\d+)#', $path, $matches)) {
-        return douban_media_card_html($url, $host, douban_subject_type($host, $path), $matches[1]);
     }
 
     return '';
@@ -6078,6 +5787,9 @@ function render_layout(string $title, string $content, array $options = []): voi
   <?php if ($mode === 'public') { theme_action('head', $themeContext); } ?>
 </head>
 <body class="<?= h($bodyClass) ?>"<?= $pluginSettingsSlug !== '' ? ' data-admin-plugin-settings="' . h($pluginSettingsSlug) . '"' : '' ?>>
+  <?php if ($mode !== 'public' && $admin && cached_github_update_info() === null): ?>
+  <div hidden data-admin-update-check data-url="<?= h(url_for('check_update')) ?>" data-csrf="<?= h(csrf_token()) ?>" data-link-label="<?= h(sblog_t('查看更新说明')) ?>"></div>
+  <?php endif; ?>
   <?php if ($mode !== 'public' && $admin): ?>
   <script>
     try {
@@ -6468,6 +6180,7 @@ function render_admin_sidebar(string $active, array $summary = []): string
 function render_admin_topbar(string $title, string $actionLabel = '', string $actionUrl = ''): string
 {
     $unreadComments = unread_comment_count();
+    $programUpdate = cached_github_update_info();
     $notificationUrl = $unreadComments > 0 ? admin_comments_url('unread') : url_for('admin_comments');
     $flash = pull_flash();
     $flashContext = (string)($flash['context'] ?? '');
@@ -6514,6 +6227,15 @@ function render_admin_topbar(string $title, string $actionLabel = '', string $ac
           <strong><?= h(sblog_t('数据库升级尚未完成。')) ?></strong>
           <?= h(sblog_t('请执行升级脚本，完成后此提醒会自动消失。')) ?>
           <a class="admin-global-notice__action" href="<?= h(asset_url('update.php')) ?>"><?= h(sblog_t('执行数据库升级')) ?></a>
+        </span>
+      </div>
+    <?php endif; ?>
+    <?php if (!empty($programUpdate['available'])): ?>
+      <div class="flash flash--warning admin-global-notice" role="status" data-program-update-notice>
+        <span class="admin-global-notice__icon"><?= admin_icon('refresh') ?></span>
+        <span>
+          <strong><?= h(sblog_t('发现新版本 {version}', ['version' => (string)$programUpdate['latest']])) ?></strong>
+          <a class="admin-global-notice__action" href="<?= h(url_for('admin') . '#program-update') ?>"><?= h(sblog_t('查看更新说明')) ?></a>
         </span>
       </div>
     <?php endif; ?>
@@ -7361,7 +7083,7 @@ function render_admin_page(): void
     require_admin();
 
     $metrics = admin_metrics();
-    $update = github_update_info();
+    $update = cached_github_update_info() ?? ['latest' => ''];
     $updateRequiresDatabase = !empty($update['requires_database_upgrade']);
     $updateDatabaseKnown = !empty($update['database_schema_known']);
     $updateDatabaseIncompatible = !empty($update['database_schema_incompatible']);
@@ -7396,6 +7118,22 @@ function render_admin_page(): void
                   <input type="hidden" name="expected_database_schema" value="<?= $updateDatabaseKnown ? h($update['database_schema']) : '' ?>">
                   <button class="button button--primary" type="submit"<?= $updateDatabaseIncompatible ? ' disabled' : '' ?>><?= h(sblog_t('立即更新')) ?></button>
                 </form>
+              </div>
+            </section>
+          <?php endif; ?>
+          <?php if (!empty($update['latest']) && empty($update['error'])): ?>
+            <section id="program-update" class="panel admin-list-panel admin-release-notes admin-animate">
+              <div class="panel__header">
+                <div class="admin-head">
+                  <div class="admin-head-left">
+                    <h2><?= h(sblog_t('更新说明')) ?> · <?= h($update['latest']) ?></h2>
+                    <p class="panel__meta"><?= h(sblog_t('进入后台时每 24 小时自动检查一次，也可随时手动检测更新。')) ?></p>
+                  </div>
+                  <a class="button button--secondary button--compact" href="<?= h('https://github.com/' . UPDATE_REPOSITORY . '/releases/tag/' . rawurlencode((string)$update['latest'])) ?>" target="_blank" rel="noopener noreferrer"><?= h(sblog_t('在 GitHub 查看')) ?></a>
+                </div>
+              </div>
+              <div class="panel__body">
+                <div class="admin-release-notes__body"><?= h(trim((string)($update['release_notes'] ?? '')) ?: sblog_t('此版本暂无更新说明。')) ?></div>
               </div>
             </section>
           <?php endif; ?>
@@ -8756,7 +8494,7 @@ function render_admin_theme_settings_page(): void
 function admin_settings_sections(): array
 {
     return [
-        'general' => ['label' => '常规', 'title' => '常规设置', 'description' => '站点名称、语言、地址与图标。'],
+        'general' => ['label' => '常规', 'title' => '常规设置', 'description' => '站点名称、语言、时区、地址与图标。'],
         'reading' => ['label' => '阅读', 'title' => '阅读设置', 'description' => '首页文章数量与搜索引擎摘要。'],
         'discussion' => ['label' => '讨论', 'title' => '讨论设置', 'description' => '评论提交、审核与通知。'],
         'permalinks' => ['label' => '固定链接', 'title' => '固定链接设置', 'description' => '文章链接格式与服务器配置。'],
@@ -8781,6 +8519,7 @@ function admin_settings_values(string $section, array $input): array
             'site_tagline' => $value('site_tagline'),
             'site_url' => $value('site_url'),
             'favicon_url' => $value('favicon_url') ?: default_settings()['favicon_url'],
+            'site_timezone' => array_key_exists('site_timezone', $input) ? $value('site_timezone') : site_timezone(),
         ],
         'reading' => [
             'posts_per_page' => (string)max(1, min(24, (int)$value('posts_per_page', default_settings()['posts_per_page']))),
@@ -8846,6 +8585,16 @@ function render_admin_settings_page(): void
                   <?php endforeach; ?>
                 </select>
                 <p class="field-hint"><?= h(sblog_t('语言包安装后自动启用；在此选择并保存后，应用于前台、登录页和后台。')) ?></p>
+              </div>
+              <div class="field">
+                <label for="site_timezone"><?= h(sblog_t('时区')) ?></label>
+                <select id="site_timezone" name="site_timezone" aria-describedby="site_timezone_hint">
+                  <?php $timezoneNow = new DateTimeImmutable(); $currentTimezone = site_timezone(); ?>
+                  <?php foreach (timezone_identifiers_list() as $timezone): ?>
+                    <option value="<?= h($timezone) ?>"<?= $currentTimezone === $timezone ? ' selected' : '' ?>><?= h('UTC' . $timezoneNow->setTimezone(new DateTimeZone($timezone))->format('P') . ' · ' . $timezone) ?></option>
+                  <?php endforeach; ?>
+                </select>
+                <p id="site_timezone_hint" class="field-hint"><?= h(sblog_t('默认 UTC+08:00（北京时间），文章、评论及发布时间均使用此时区。')) ?></p>
               </div>
               <div class="field"><label for="site_tagline"><?= h(sblog_t('首页副标题')) ?></label><input id="site_tagline" name="site_tagline" type="text" value="<?= h(setting('site_tagline')) ?>"></div>
               <div class="field">
@@ -9146,7 +8895,7 @@ function render_editor_page(?array $existing = null, array $form = [], array $er
                     <div class="attachment-list" aria-live="polite"></div>
                   </div>
                 </div>
-                <p class="field-hint"><?= h(sblog_t('支持 Markdown；将网易云音乐、哔哩哔哩、YouTube 或豆瓣链接单独放在一段可自动解析。')) ?></p>
+                <p class="field-hint"><?= h(sblog_t('支持 Markdown；将网易云音乐、哔哩哔哩或 YouTube 链接单独放在一段可自动解析。')) ?></p>
               </div>
 
               <details class="editor-settings" data-editor-settings<?= $errors ? ' open' : '' ?>>
@@ -9212,6 +8961,8 @@ if (!is_installed()) {
     redirect_to(install_url());
 }
 
+date_default_timezone_set(site_timezone());
+
 load_active_plugins();
 plugin_action('plugins_loaded', ['plugins' => $GLOBALS['sblog_loaded_plugins'] ?? []]);
 ob_start('plugin_output_buffer');
@@ -9230,7 +8981,6 @@ $GLOBALS['sblog_current_action'] = $action;
 plugin_action('request', ['action' => $action, 'request' => $pluginRequest]);
 
 $pageRenderers = [
-    'douban_cover' => 'render_douban_cover',
     'rss' => 'render_rss_feed',
     'sitemap' => 'render_sitemap',
     'archives' => 'render_archives',
@@ -9675,8 +9425,24 @@ switch ($action) {
 
     case 'check_update':
         require_admin_post(url_for('admin'));
-        $update = github_update_info(true);
+        $automatic = ($_POST['automatic'] ?? '') === '1';
+        if ($automatic && session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
+        try {
+            $update = github_update_info(!$automatic);
+        } catch (Throwable $exception) {
+            $update = ['available' => false, 'error' => $exception->getMessage()];
+        }
         $updateError = trim((string)($update['error'] ?? ''));
+        if ($automatic) {
+            json_response([
+                'ok' => $updateError === '',
+                'available' => !empty($update['available']),
+                'message' => $updateError !== ''
+                    ? sblog_t('检测更新失败：{error}', ['error' => $updateError])
+                    : (!empty($update['available']) ? sblog_t('发现新版本 {version}', ['version' => (string)$update['latest']]) : ''),
+                'details_url' => url_for('admin'),
+            ]);
+        }
         if ($updateError !== '') {
             set_flash('error', sblog_t('检测更新失败：{error}', ['error' => $updateError]));
         } elseif (!empty($update['available'])) {
@@ -9884,6 +9650,10 @@ switch ($action) {
         }
         if (isset($values['site_url']) && $values['site_url'] !== '' && !valid_site_url($values['site_url'])) {
             set_flash('error', sblog_t('站点地址必须是不带查询参数的完整 HTTP 或 HTTPS 地址。'));
+            redirect_to($returnUrl, 303);
+        }
+        if (isset($values['site_timezone']) && !in_array($values['site_timezone'], timezone_identifiers_list(), true)) {
+            set_flash('error', sblog_t('所选时区无效，请重新选择。'));
             redirect_to($returnUrl, 303);
         }
         if ($legacyForm || $section === 'general') {
