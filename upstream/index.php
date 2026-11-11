@@ -23,7 +23,7 @@ session_set_cookie_params([
 ]);
 session_start();
 
-const APP_VERSION = 'v1.14.30';
+const APP_VERSION = 'v1.14.34';
 const DATABASE_SCHEMA_VERSION = 1;
 const DATABASE_MAINTENANCE_VERSION = 1;
 const DATA_DIR = __DIR__ . '/data';
@@ -764,6 +764,7 @@ function plugin_manifest(string $slug): ?array
         'slug' => $slug,
         'name' => str_sub_u($name, 0, 100),
         'version' => str_sub_u(trim((string)($manifest['version'] ?? '')), 0, 40),
+        'requires' => str_sub_u(trim((string)($manifest['requires'] ?? '')), 0, 40),
         'author' => str_sub_u(trim((string)($manifest['author'] ?? '')), 0, 100),
         'url' => $url,
         'description' => str_sub_u(trim((string)($manifest['description'] ?? '')), 0, 300),
@@ -2880,6 +2881,7 @@ function theme_manifest(string $slug): ?array
             'slug' => 'default',
             'name' => 'Default 黑白文字',
             'version' => APP_VERSION,
+            'requires' => '',
             'author' => 'Simple PHP Blog',
             'url' => 'https://github.com/jkjoy/Simple-PHP-Blog',
             'description' => '程序内置的极简黑白文字主题，专注清晰阅读与内容本身。',
@@ -2926,6 +2928,7 @@ function theme_manifest(string $slug): ?array
         'slug' => $slug,
         'name' => str_sub_u($name, 0, 100),
         'version' => str_sub_u(trim((string)($manifest['version'] ?? '')), 0, 40),
+        'requires' => str_sub_u(trim((string)($manifest['requires'] ?? '')), 0, 40),
         'author' => str_sub_u(trim((string)($manifest['author'] ?? '')), 0, 100),
         'url' => $url,
         'description' => str_sub_u(trim((string)($manifest['description'] ?? '')), 0, 300),
@@ -3928,11 +3931,6 @@ function render_inline(string $text): string
     return $html;
 }
 
-function media_host_matches(string $host, string $domain): bool
-{
-    return $host === $domain || str_ends_with($host, '.' . $domain);
-}
-
 function media_url_from_paragraph(string $text): string
 {
     $text = trim($text);
@@ -3946,18 +3944,6 @@ function media_url_from_paragraph(string $text): string
     return '';
 }
 
-function media_iframe_html(string $provider, string $src, string $kind = 'video', int $height = 0): string
-{
-    $class = $kind === 'audio' ? 'media-embed media-embed--audio' : 'media-embed media-embed--video';
-    $style = $height > 0 ? ' style="--media-height:' . $height . 'px"' : '';
-    $allow = $kind === 'video'
-        ? ' allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowfullscreen'
-        : '';
-
-    return '<figure class="' . $class . '"' . $style . '><iframe src="' . h($src) . '" title="' . h($provider)
-        . '" loading="lazy" referrerpolicy="strict-origin-when-cross-origin"' . $allow . '></iframe></figure>';
-}
-
 function media_embed_html(string $url): string
 {
     if (!filter_var($url, FILTER_VALIDATE_URL)) {
@@ -3967,74 +3953,12 @@ function media_embed_html(string $url): string
     $parts = parse_url($url);
     $scheme = str_lower_u((string)($parts['scheme'] ?? ''));
     $host = str_lower_u((string)($parts['host'] ?? ''));
-    $host = preg_replace('/^www\./', '', $host) ?? $host;
-    $path = (string)($parts['path'] ?? '');
     if (!in_array($scheme, ['http', 'https'], true) || $host === '') {
         return '';
     }
 
     $customEmbed = plugin_filter('media_embed_html', null, ['url' => $url]);
-    if (is_string($customEmbed)) {
-        return $customEmbed;
-    }
-
-    $query = [];
-    parse_str((string)($parts['query'] ?? ''), $query);
-
-    if (media_host_matches($host, 'music.163.com')) {
-        $route = trim($path, '/');
-        $fragment = (string)($parts['fragment'] ?? '');
-        if (str_contains($fragment, '?')) {
-            [$fragmentRoute, $fragmentQuery] = explode('?', $fragment, 2);
-            $route = trim($fragmentRoute, '/');
-            parse_str($fragmentQuery, $query);
-        }
-
-        $types = [
-            'song' => ['type' => 2, 'height' => 86],
-            'playlist' => ['type' => 0, 'height' => 450],
-            'album' => ['type' => 1, 'height' => 450],
-        ];
-        $id = (string)($query['id'] ?? '');
-        if (isset($types[$route]) && is_ascii_digits($id)) {
-            $config = $types[$route];
-            $src = 'https://music.163.com/outchain/player?type=' . $config['type'] . '&id=' . rawurlencode($id)
-                . '&auto=0&height=' . ($config['height'] - 20);
-            return media_iframe_html(sblog_t('网易云音乐'), $src, 'audio', $config['height']);
-        }
-    }
-
-    if (media_host_matches($host, 'bilibili.com')
-        && preg_match('#/(?:video/)?(BV[0-9A-Za-z]+|av(\d+))#i', $path, $matches)) {
-        $parameter = stripos($matches[1], 'BV') === 0
-            ? 'bvid=' . rawurlencode($matches[1])
-            : 'aid=' . rawurlencode($matches[2]);
-        $page = isset($query['p']) && is_ascii_digits((string)$query['p']) ? '&page=' . (int)$query['p'] : '';
-        return media_iframe_html(
-            sblog_t('哔哩哔哩视频'),
-            'https://player.bilibili.com/player.html?' . $parameter . $page . '&high_quality=1&danmaku=0&as_wide=1'
-        );
-    }
-
-    if (media_host_matches($host, 'youtube.com') || $host === 'youtu.be') {
-        $videoId = '';
-        if ($host === 'youtu.be') {
-            $videoId = trim($path, '/');
-        } elseif (isset($query['v'])) {
-            $videoId = (string)$query['v'];
-        } elseif (preg_match('#/(?:embed|shorts|live)/([^/?]+)#', $path, $matches)) {
-            $videoId = $matches[1];
-        }
-
-        if (preg_match('/^[0-9A-Za-z_-]{6,15}$/', $videoId)) {
-            return media_iframe_html(
-                sblog_t('YouTube 视频'),
-                'https://www.youtube-nocookie.com/embed/' . rawurlencode($videoId)
-            );
-        }
-    }
-
-    return '';
+    return is_string($customEmbed) ? $customEmbed : '';
 }
 
 function markdown_table_cells(string $line): array
@@ -7121,7 +7045,7 @@ function render_admin_page(): void
               </div>
             </section>
           <?php endif; ?>
-          <?php if (!empty($update['latest']) && empty($update['error'])): ?>
+          <?php if (!empty($update['available']) && !empty($update['latest']) && empty($update['error'])): ?>
             <section id="program-update" class="panel admin-list-panel admin-release-notes admin-animate">
               <div class="panel__header">
                 <div class="admin-head">
@@ -7503,7 +7427,6 @@ function render_admin_comments_page(): void
                             <strong class="comment-author__name" title="<?= h($comment['author_name']) ?>"><?php if ($authorUrl !== '#'): ?><a href="<?= h($authorUrl) ?>" target="_blank" rel="noopener noreferrer nofollow"><?= h($comment['author_name']) ?></a><?php else: ?><?= h($comment['author_name']) ?><?php endif; ?></strong>
                             <span class="comment-author__email" title="<?= h($comment['author_email']) ?>"><?= h($comment['author_email']) ?></span>
                             <?php if ((string)$comment['ip_address'] !== ''): ?><span class="comment-author__ip" title="<?= h(sblog_t('IP：{address}', ['address' => (string)$comment['ip_address']])) ?>"><?= h(sblog_t('IP：{address}', ['address' => (string)$comment['ip_address']])) ?></span><?php endif; ?>
-                            <?php if ($authorUrl !== '#'): ?><a class="comment-author__website" href="<?= h($authorUrl) ?>" target="_blank" rel="noopener noreferrer nofollow"><?= h((string)parse_url($authorUrl, PHP_URL_HOST)) ?></a><?php endif; ?>
                           </div>
                         </td>
                         <td class="comment-table__content">
@@ -8030,6 +7953,7 @@ function render_admin_store_page(): void
     $visible = array_slice($visible, ($page - 1) * 12, 12, true);
     $activeTheme = active_theme_slug();
     $activePlugins = active_plugin_slugs(true);
+    $settingsPlugins = admin_plugin_settings();
     $sidebar = render_admin_sidebar('store');
     $storeUrl = url_for('admin_store');
 
@@ -8084,6 +8008,16 @@ function render_admin_store_page(): void
                 $isActive = $type === 'theme' ? $activeTheme === $slug : in_array($slug, $activePlugins, true);
                 $compatible = extension_is_compatible($extension);
                 $actionLabel = $installed === null ? sblog_t('安装') : ($isUpdate ? sblog_t('更新') : sblog_t('重新安装'));
+                $settingsUrl = '';
+                if ($installed !== null) {
+                    if ($type === 'theme' && theme_settings_schema($slug)) {
+                        $settingsUrl = url_with_query(url_for('admin_theme_settings'), ['theme' => $slug]);
+                    } elseif ($type === 'plugin' && (string)($installed['locale'] ?? '') !== '') {
+                        $settingsUrl = url_with_query(url_for('admin_settings'), ['section' => 'general']);
+                    } elseif ($type === 'plugin' && isset($settingsPlugins[$slug])) {
+                        $settingsUrl = script_url() . '?a=' . rawurlencode((string)$settingsPlugins[$slug]['settings_action']);
+                    }
+                }
                 ?>
                 <article class="extension-card<?= $isActive ? ' is-active' : '' ?>">
                   <div class="extension-card__icon" aria-hidden="true"><?= admin_icon($type === 'theme' ? 'themes' : 'plugins') ?></div>
@@ -8091,7 +8025,7 @@ function render_admin_store_page(): void
                     <div class="extension-card__heading">
                       <div>
                         <h2><?= h($extension['name']) ?></h2>
-                        <p><?= h($slug) ?> · <?= h($storeVersion) ?></p>
+                        <p><?= h($slug) ?></p>
                       </div>
                       <div class="extension-card__badges">
                         <span class="status-badge status-badge--draft"><?= h($type === 'theme' ? sblog_t('主题') : sblog_t('插件')) ?></span>
@@ -8099,17 +8033,17 @@ function render_admin_store_page(): void
                         <?php if ($isUpdate): ?><span class="status-badge status-badge--scheduled"><?= h(sblog_t('可更新')) ?></span><?php endif; ?>
                       </div>
                     </div>
-                    <p class="extension-card__description"><?= h((string)($extension['description'] ?: sblog_t('该扩展没有提供说明。'))) ?></p>
                     <div class="extension-card__meta">
+                      <span aria-label="<?= h(sblog_t('版本')) ?>"><?= h($storeVersion) ?></span>
                       <span><?= h((string)($extension['author'] ?: sblog_t('作者未注明'))) ?></span>
                       <?php if ((string)$extension['requires'] !== ''): ?><span><?= h(sblog_t('需要 SBlog {version}+', ['version' => (string)$extension['requires']])) ?></span><?php endif; ?>
-                      <?php if ($installed !== null): ?><span><?= h(sblog_t('已安装 {version}', ['version' => $installedVersion !== '' ? $installedVersion : sblog_t('未知版本')])) ?></span><?php endif; ?>
                     </div>
+                    <p class="extension-card__description"><?= h((string)($extension['description'] ?: sblog_t('该扩展没有提供说明。'))) ?></p>
                     <div class="extension-card__footer">
                       <?php if (!$compatible): ?>
                         <span class="button button--ghost is-disabled" aria-disabled="true"><?= h(sblog_t('版本不兼容')) ?></span>
                       <?php elseif ($isCurrent): ?>
-                        <span class="button button--ghost is-disabled" aria-disabled="true"><?= h(sblog_t('已安装')) ?></span>
+                        <?php if ($settingsUrl === ''): ?><span class="button button--ghost is-disabled" aria-disabled="true"><?= h(sblog_t('已安装')) ?></span><?php endif; ?>
                       <?php else: ?>
                         <form method="post" action="<?= h(url_for('install_extension')) ?>" data-extension-install data-install-notice="<?= h(sblog_t($isUpdate ? '正在升级 {name}，请稍候。请勿关闭或刷新页面。' : '正在安装 {name}，请稍候。请勿关闭或刷新页面。', ['name' => (string)$extension['name']])) ?>">
                           <?= csrf_field() ?>
@@ -8119,9 +8053,10 @@ function render_admin_store_page(): void
                           <input type="hidden" name="return_q" value="<?= h($search) ?>">
                           <input type="hidden" name="return_page" value="<?= $page ?>">
                           <input type="hidden" name="return_to" value="store">
-                          <button class="button" type="submit"><?= h($actionLabel) ?></button>
+                          <button class="button<?= $isUpdate ? ' button--success' : '' ?>" type="submit"><?= h($actionLabel) ?></button>
                         </form>
                       <?php endif; ?>
+                      <?php if ($settingsUrl !== ''): ?><a class="button button--ghost" href="<?= h($settingsUrl) ?>"><?= h(sblog_t('设置')) ?></a><?php endif; ?>
                     </div>
                   </div>
                 </article>
@@ -8156,6 +8091,7 @@ function render_admin_plugins_page(): void
     $page = max(1, min($totalPages, $requestedPage));
     $visiblePlugins = array_slice($plugins, ($page - 1) * 12, 12, true);
     $active = active_plugin_slugs(true);
+    $settingsPlugins = admin_plugin_settings();
     $errors = is_array($GLOBALS['sblog_plugin_errors'] ?? null) ? $GLOBALS['sblog_plugin_errors'] : [];
     $sidebar = render_admin_sidebar('plugins');
 
@@ -8200,6 +8136,7 @@ function render_admin_plugins_page(): void
                         <div class="extension-meta">
                           <span aria-label="<?= h(sblog_t('版本')) ?>"><?= h((string)($plugin['version'] ?: '—')) ?></span>
                           <?php if ($plugin['author'] !== ''): ?><span><?php if ($plugin['url'] !== ''): ?><a href="<?= h($plugin['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h($plugin['author']) ?></a><?php else: ?><?= h($plugin['author']) ?><?php endif; ?></span><?php endif; ?>
+                          <?php if ((string)($plugin['requires'] ?? '') !== ''): ?><span><?= h(sblog_t('需要 SBlog {version}+', ['version' => (string)$plugin['requires']])) ?></span><?php endif; ?>
                           <?php if (is_array($update)): ?><span class="extension-update-label"<?= $updateCompatible ? '' : ' title="' . h(sblog_t('需要 SBlog {version}+', ['version' => (string)$update['requires']])) . '"' ?>><?= h(sblog_t('新版本 {version}', ['version' => (string)$update['version']])) ?><?= $updateCompatible ? '' : ' · ' . h(sblog_t('版本不兼容')) ?></span><?php endif; ?>
                         </div>
                       </td>
@@ -8221,7 +8158,7 @@ function render_admin_plugins_page(): void
                                 <input type="hidden" name="slug" value="<?= h($slug) ?>">
                                 <input type="hidden" name="return_to" value="plugins">
                                 <input type="hidden" name="return_page" value="<?= $page ?>">
-                                <button class="button" type="submit"><?= h(sblog_t('升级')) ?></button>
+                                <button class="button button--success" type="submit"><?= h(sblog_t('升级')) ?></button>
                               </form>
                           <?php endif; ?>
                           <?php if (!$isLanguage): ?>
@@ -8230,26 +8167,22 @@ function render_admin_plugins_page(): void
                             <input type="hidden" name="plugin" value="<?= h($slug) ?>">
                             <input type="hidden" name="operation" value="<?= $isActive ? 'deactivate' : 'activate' ?>">
                             <input type="hidden" name="return_page" value="<?= $page ?>">
-                            <button class="button <?= $isActive || $updateCompatible ? 'button--secondary' : '' ?>" type="submit"><?= h($isActive ? sblog_t('停用') : sblog_t('启用')) ?></button>
+                            <button class="button<?= $isActive ? ' button--warning' : ($updateCompatible ? ' button--secondary' : '') ?>" type="submit"><?= h($isActive ? sblog_t('停用') : sblog_t('启用')) ?></button>
                           </form>
                           <?php endif; ?>
-                          <?php if ($isLanguage || !$isActive || (string)$plugin['settings_action'] !== ''): ?>
-                          <details class="extension-actions-menu" data-extension-menu>
-                            <summary class="button button--ghost"><?= h(sblog_t('更多')) ?></summary>
-                            <div class="extension-actions-menu__items">
-                              <?php if ($isActive && (string)$plugin['settings_action'] !== ''): ?><a href="<?= h(script_url() . '?a=' . rawurlencode((string)$plugin['settings_action'])) ?>"><?= h(sblog_t('设置')) ?></a><?php endif; ?>
-                              <?php if ($isLanguage): ?><a href="<?= h(url_with_query(url_for('admin_settings'), ['section' => 'general'])) ?>"><?= h(sblog_t('选择语言')) ?></a><?php endif; ?>
-                              <?php if (!$isActive || $isLanguage): ?>
+                          <?php if ($isLanguage): ?>
+                            <a class="button button--ghost" href="<?= h(url_with_query(url_for('admin_settings'), ['section' => 'general'])) ?>"><?= h(sblog_t('设置')) ?></a>
+                          <?php elseif (isset($settingsPlugins[$slug])): ?>
+                            <a class="button button--ghost" href="<?= h(script_url() . '?a=' . rawurlencode((string)$settingsPlugins[$slug]['settings_action'])) ?>"><?= h(sblog_t('设置')) ?></a>
+                          <?php endif; ?>
+                          <?php if (!$isActive || $isLanguage): ?>
                             <form method="post" action="<?= h(url_for('uninstall_extension')) ?>" data-confirm="<?= h(sblog_t('确定卸载插件 {name} 吗？服务器上的插件文件将被永久删除。', ['name' => (string)$displayMetadata['name']])) ?>">
                               <?= csrf_field() ?>
                               <input type="hidden" name="type" value="plugin">
                               <input type="hidden" name="slug" value="<?= h($slug) ?>">
                               <input type="hidden" name="return_page" value="<?= $page ?>">
-                              <button class="extension-action--danger" type="submit"><?= h(sblog_t('卸载')) ?></button>
+                              <button class="button button--danger" type="submit"><?= h(sblog_t('卸载')) ?></button>
                             </form>
-                              <?php endif; ?>
-                            </div>
-                          </details>
                           <?php endif; ?>
                         </div>
                       </td>
@@ -8334,6 +8267,7 @@ function render_admin_themes_page(): void
                       <div class="extension-meta">
                         <span aria-label="<?= h(sblog_t('版本')) ?>"><?= h((string)($theme['version'] ?: '—')) ?></span>
                         <?php if ($theme['author'] !== ''): ?><span><?php if ($theme['url'] !== ''): ?><a href="<?= h($theme['url']) ?>" target="_blank" rel="noopener noreferrer"><?= h($theme['author']) ?></a><?php else: ?><?= h($theme['author']) ?><?php endif; ?></span><?php endif; ?>
+                        <?php if ((string)($theme['requires'] ?? '') !== ''): ?><span><?= h(sblog_t('需要 SBlog {version}+', ['version' => (string)$theme['requires']])) ?></span><?php endif; ?>
                         <?php if (is_array($update)): ?><span class="extension-update-label"<?= $updateCompatible ? '' : ' title="' . h(sblog_t('需要 SBlog {version}+', ['version' => (string)$update['requires']])) . '"' ?>><?= h(sblog_t('新版本 {version}', ['version' => (string)$update['version']])) ?><?= $updateCompatible ? '' : ' · ' . h(sblog_t('版本不兼容')) ?></span><?php endif; ?>
                       </div>
                     </td>
@@ -8350,7 +8284,7 @@ function render_admin_themes_page(): void
                               <input type="hidden" name="slug" value="<?= h($slug) ?>">
                               <input type="hidden" name="return_to" value="themes">
                               <input type="hidden" name="return_page" value="<?= $page ?>">
-                              <button class="button" type="submit"><?= h(sblog_t('升级')) ?></button>
+                              <button class="button button--success" type="submit"><?= h(sblog_t('升级')) ?></button>
                             </form>
                         <?php endif; ?>
                         <form method="post" action="<?= h(url_for('activate_theme')) ?>" data-theme-activate<?= $isActive ? ' hidden' : '' ?>>
@@ -8364,25 +8298,20 @@ function render_admin_themes_page(): void
                             <?= csrf_field() ?>
                             <input type="hidden" name="theme" value="default">
                             <input type="hidden" name="return_page" value="<?= $page ?>">
-                            <button class="button button--secondary" type="submit"><?= h(sblog_t('停用')) ?></button>
+                            <button class="button button--warning" type="submit"><?= h(sblog_t('停用')) ?></button>
                           </form>
                         <?php endif; ?>
-                        <details class="extension-actions-menu" data-extension-menu>
-                          <summary class="button button--ghost"><?= h(sblog_t('更多')) ?></summary>
-                          <div class="extension-actions-menu__items">
-                            <a href="<?= h($previewUrl) ?>" target="_blank" rel="noopener noreferrer" aria-label="<?= h($previewLabel) ?>"><?= h(sblog_t('打开预览')) ?></a>
-                            <?php if (theme_settings_schema((string)$slug)): ?><a href="<?= h(url_with_query(url_for('admin_theme_settings'), ['theme' => (string)$slug])) ?>"><?= h(sblog_t('主题设置')) ?></a><?php endif; ?>
+                        <?php if (theme_settings_schema((string)$slug)): ?><a class="button button--ghost" href="<?= h(url_with_query(url_for('admin_theme_settings'), ['theme' => (string)$slug])) ?>"><?= h(sblog_t('设置')) ?></a><?php endif; ?>
+                        <a class="button button--ghost" href="<?= h($previewUrl) ?>" target="_blank" rel="noopener noreferrer" aria-label="<?= h($previewLabel) ?>"><?= h(sblog_t('打开预览')) ?></a>
                           <?php if ($slug !== 'default'): ?>
                           <form method="post" action="<?= h(url_for('uninstall_extension')) ?>" data-theme-uninstall<?= $isActive ? ' hidden' : '' ?> data-confirm="<?= h(sblog_t('确定卸载主题 {name} 吗？服务器上的主题文件将被永久删除。', ['name' => $themeName])) ?>">
                             <?= csrf_field() ?>
                             <input type="hidden" name="type" value="theme">
                             <input type="hidden" name="slug" value="<?= h($slug) ?>">
                             <input type="hidden" name="return_page" value="<?= $page ?>">
-                            <button class="extension-action--danger" type="submit"><?= h(sblog_t('卸载')) ?></button>
+                            <button class="button button--danger" type="submit"><?= h(sblog_t('卸载')) ?></button>
                           </form>
                         <?php endif; ?>
-                          </div>
-                        </details>
                       </div>
                     </td>
                   </tr>
@@ -8765,6 +8694,8 @@ function render_editor_page(?array $existing = null, array $form = [], array $er
     $settingsHtml = is_string($settingsHtml) ? $settingsHtml : '';
     $afterFormHtml = plugin_filter('editor_after_form_html', '', $editorContext);
     $afterFormHtml = is_string($afterFormHtml) ? $afterFormHtml : '';
+    $contentHint = plugin_filter('editor_content_hint', sblog_t('支持 Markdown。'), $editorContext);
+    $contentHint = is_string($contentHint) ? $contentHint : sblog_t('支持 Markdown。');
     $sidebar = render_admin_sidebar($isEdit ? 'edit' : 'write');
 
     ob_start();
@@ -8895,7 +8826,7 @@ function render_editor_page(?array $existing = null, array $form = [], array $er
                     <div class="attachment-list" aria-live="polite"></div>
                   </div>
                 </div>
-                <p class="field-hint"><?= h(sblog_t('支持 Markdown；将网易云音乐、哔哩哔哩或 YouTube 链接单独放在一段可自动解析。')) ?></p>
+                <p class="field-hint"><?= h($contentHint) ?></p>
               </div>
 
               <details class="editor-settings" data-editor-settings<?= $errors ? ' open' : '' ?>>
